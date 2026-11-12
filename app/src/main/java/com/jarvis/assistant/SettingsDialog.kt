@@ -162,12 +162,13 @@ class SettingsDialog(
             typeface = context.font(10.5f, true)
             gravity = Gravity.CENTER
             setTextColor(Palette.cyan)
-            setPadding(0, context.dp(14f), 0, context.dp(14f))
+            background = context.roundedBackground(Palette.panel, withAlpha(Palette.cyan, 0.18f), 15f, 1f)
+            setPadding(context.dp(14f), context.dp(15f), context.dp(14f), context.dp(15f))
             isClickable = true
             contentDescription = "Check for app updates"
             setOnClickListener { onCheckUpdates() }
         }
-        content.addView(checkUpdates, matchWrap().apply { topMargin = context.dp(6f) })
+        content.addView(checkUpdates, matchWrap().apply { topMargin = context.dp(8f) })
 
         modelValue = addSelector(content, "LIVE MODEL", JarvisPrefs.modelLabel()) { valueView ->
             val labels = JarvisPrefs.models.map { it.label }
