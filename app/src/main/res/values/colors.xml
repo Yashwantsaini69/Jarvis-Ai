@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#04060C</color>
+    <color name="bg_panel">#0A111C</color>
+    <color name="cyan">#5FE8FF</color>
+    <color name="cyan_dim">#2A8FAD</color>
+    <color name="gold">#FFC56B</color>
+    <color name="ice">#EAFBFF</color>
+    <color name="danger">#FF5C6C</color>
+</resources>
