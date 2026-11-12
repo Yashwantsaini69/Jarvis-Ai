@@ -155,6 +155,20 @@ class SettingsDialog(
         keyHelpRow.addView(getKeyLink)
         content.addView(keyHelpRow, matchWrap().apply { topMargin = context.dp(8f) })
 
+        val checkUpdates = TextView(context).apply {
+            text = "CHECK FOR UPDATES"
+            textSize = 10.5f
+            letterSpacing = 0.22f
+            typeface = context.font(10.5f, true)
+            gravity = Gravity.CENTER
+            setTextColor(Palette.cyan)
+            setPadding(0, context.dp(14f), 0, context.dp(14f))
+            isClickable = true
+            contentDescription = "Check for app updates"
+            setOnClickListener { onCheckUpdates() }
+        }
+        content.addView(checkUpdates, matchWrap().apply { topMargin = context.dp(6f) })
+
         modelValue = addSelector(content, "LIVE MODEL", JarvisPrefs.modelLabel()) { valueView ->
             val labels = JarvisPrefs.models.map { it.label }
             val checked = JarvisPrefs.models.indexOfFirst { it.id == selectedModel }.coerceAtLeast(0)
@@ -333,20 +347,6 @@ class SettingsDialog(
             setOnClickListener { save() }
         }
         content.addView(save, matchWrap().apply { topMargin = context.dp(28f) })
-
-        val checkUpdates = TextView(context).apply {
-            text = "CHECK FOR UPDATES"
-            textSize = 10.5f
-            letterSpacing = 0.22f
-            typeface = context.font(10.5f, true)
-            gravity = Gravity.CENTER
-            setTextColor(Palette.cyan)
-            setPadding(0, context.dp(14f), 0, context.dp(14f))
-            isClickable = true
-            contentDescription = "Check for app updates"
-            setOnClickListener { onCheckUpdates() }
-        }
-        content.addView(checkUpdates, matchWrap().apply { topMargin = context.dp(10f) })
 
         content.addView(
             context.label(
