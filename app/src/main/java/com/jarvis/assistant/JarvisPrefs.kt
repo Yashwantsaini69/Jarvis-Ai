@@ -13,6 +13,15 @@ object JarvisPrefs {
     const val MODEL_38_THINKING = "gemini-3.8-live-extended-thinking"
     const val MODEL_25_LIVE = "gemini-2.5-flash-native-audio-preview-12-2025"
 
+    const val DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+    val groqFallbackModels = listOf(
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "llama-3.1-70b-versatile",
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b"
+    )
+
     val models = listOf(
         ModelOption("Gemini 3.8 Live", MODEL_38_LIVE),
         ModelOption("Gemini 3.8 Live Extended Thinking", MODEL_38_THINKING),
@@ -98,6 +107,20 @@ object JarvisPrefs {
     var uncensored: Boolean
         get() = sp.getBoolean("uncensored", false)
         set(value) = sp.edit().putBoolean("uncensored", value).apply()
+
+    var groqApiKey: String
+        get() = sp.getString("groq_api_key", "").orEmpty()
+        set(value) = sp.edit().putString("groq_api_key", value.trim()).apply()
+
+    var groqModel: String
+        get() = sp.getString("groq_model", DEFAULT_GROQ_MODEL) ?: DEFAULT_GROQ_MODEL
+        set(value) = sp.edit().putString("groq_model", value).apply()
+
+    var deepResearch: Boolean
+        get() = sp.getBoolean("deep_research", false)
+        set(value) = sp.edit().putBoolean("deep_research", value).apply()
+
+    fun hasGroqKey(): Boolean = groqApiKey.isNotBlank()
 
     fun effectiveInstruction(): String =
         JarvisCore.assemble(additionalInstructions, uncensored)

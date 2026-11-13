@@ -9,6 +9,8 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -30,11 +32,17 @@ class SettingsDialog(
     private val onCheckUpdates: () -> Unit = {}
 ) : Dialog(context) {
     private lateinit var keyInput: EditText
+    private lateinit var groqKeyInput: EditText
     private lateinit var instructionInput: EditText
     private lateinit var modelValue: TextView
+    private lateinit var groqModelValue: TextView
     private lateinit var voiceValue: TextView
 
     private var selectedModel = JarvisPrefs.model
+    private var selectedGroqModel = JarvisPrefs.groqModel
+    private var groqModels: List<String> = emptyList()
+    private var groqModelsKey: String? = null
+    private val main = Handler(Looper.getMainLooper())
     private var selectedVoice = JarvisPrefs.voice
     private var selectedOrb = JarvisPrefs.orbStyle
     private var selectedUncensored = JarvisPrefs.uncensored
@@ -80,7 +88,7 @@ class SettingsDialog(
         val titleColumn = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
         titleColumn.addView(context.label("SETTINGS", 19f, Palette.ice, 0.22f, true))
         titleColumn.addView(
-            context.label("GEMINI LIVE CONFIGURATION", 8.5f, Palette.cyanDim, 0.24f, false),
+            context.label("GEMINI + GROQ DUAL-BRAIN", 8.5f, Palette.cyanDim, 0.24f, false),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = context.dp(3f)
             }
@@ -90,7 +98,11 @@ class SettingsDialog(
         })
         content.addView(top)
 
-        addSection(content, "GEMINI API KEY")
+        addSection(content, "API KEYS")
+        content.addView(
+            context.label("GEMINI", 8.5f, Palette.cyanDim, 0.22f, true),
+            matchWrap().apply { topMargin = context.dp(8f) }
+        )
         keyInput = EditText(context).apply {
             setSingleLine()
             hint = "AIza..."
@@ -155,6 +167,110 @@ class SettingsDialog(
         keyHelpRow.addView(getKeyLink)
         content.addView(keyHelpRow, matchWrap().apply { topMargin = context.dp(8f) })
 
+        modelValue = addSelector(content, "GEMINI LIVE MODEL", JarvisPrefs.modelLabel()) { valueView ->
+            val labels = JarvisPrefs.models.map { it.label }
+            val checked = JarvisPrefs.models.indexOfFirst { it.id == selectedModel }.coerceAtLeast(0)
+            showChoice("Gemini live model", labels, checked) { index ->
+                selectedModel = JarvisPrefs.models[index].id
+                valueView.text = labels[index]
+            }
+        }
+        content.addView(
+            helperText("Used for live voice sessions and voice previews."),
+            matchWrap().apply { topMargin = context.dp(8f) }
+        )
+
+        content.addView(
+            context.label("GROQ · LLAMA", 8.5f, Palette.cyanDim, 0.22f, true),
+            matchWrap().apply { topMargin = context.dp(20f) }
+        )
+        groqKeyInput = EditText(context).apply {
+            setSingleLine()
+            hint = "gsk_..."
+            setHintTextColor(withAlpha(Palette.textDim, 0.75f))
+            setTextColor(Palette.ice)
+            textSize = 14.5f
+            typeface = context.font(14.5f)
+            background = null
+            includeFontPadding = false
+            setPadding(0, context.dp(10f), 0, context.dp(10f))
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(JarvisPrefs.groqApiKey)
+            setSelection(text.length)
+        }
+        val groqKeyRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        groqKeyRow.addView(groqKeyInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val showGroqKey = context.label("SHOW", 9f, Palette.cyan, 0.18f, true).apply {
+            setPadding(context.dp(12f), context.dp(10f), context.dp(2f), context.dp(10f))
+            isClickable = true
+        }
+        showGroqKey.setOnClickListener {
+            val revealing = groqKeyInput.inputType == (InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
+            val position = groqKeyInput.selectionEnd.coerceAtMost(groqKeyInput.text.length)
+            groqKeyInput.inputType = if (revealing) {
+                InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            } else {
+                InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            }
+            groqKeyInput.setSelection(position)
+            showGroqKey.text = if (revealing) "HIDE" else "SHOW"
+        }
+        groqKeyRow.addView(showGroqKey)
+        content.addView(
+            inputBox(groqKeyRow),
+            matchWrap().apply { topMargin = context.dp(8f) }
+        )
+        val groqKeyHelpRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        groqKeyHelpRow.addView(
+            helperText("Create your own key at Groq Console. It is stored only on this device."),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        val getGroqKeyLink = context.label("GET KEY  →", 9.5f, Palette.cyan, 0.18f, true).apply {
+            setPadding(context.dp(10f), context.dp(10f), 0, context.dp(10f))
+            isClickable = true
+            contentDescription = "Open Groq Console to create an API key"
+            setOnClickListener {
+                try {
+                    context.startActivity(
+                        Intent(Intent.ACTION_VIEW, Uri.parse("https://console.groq.com/keys"))
+                    )
+                } catch (_: Throwable) {
+                    Toast.makeText(context, "No browser available to open the link", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        groqKeyHelpRow.addView(getGroqKeyLink)
+        content.addView(groqKeyHelpRow, matchWrap().apply { topMargin = context.dp(8f) })
+
+        groqModelValue = addSelector(content, "GROQ MODEL", selectedGroqModel) { valueView ->
+            showGroqModelChooser(valueView)
+        }
+        content.addView(
+            helperText("All available models are fetched from your Groq key. Text chat, deep research and uncensored answers use this model."),
+            matchWrap().apply { topMargin = context.dp(8f) }
+        )
+
+        val saveKeysButton = TextView(context).apply {
+            text = "SAVE API KEYS"
+            textSize = 10.5f
+            letterSpacing = 0.22f
+            typeface = context.font(10.5f, true)
+            gravity = Gravity.CENTER
+            setTextColor(Palette.bg)
+            background = context.roundedBackground(Palette.cyan, Palette.cyan, 15f, 1f)
+            setPadding(context.dp(14f), context.dp(15f), context.dp(14f), context.dp(15f))
+            isClickable = true
+            contentDescription = "Save both API keys and models"
+            setOnClickListener { saveApiKeys() }
+        }
+        content.addView(saveKeysButton, matchWrap().apply { topMargin = context.dp(12f) })
+
         val checkUpdates = TextView(context).apply {
             text = "CHECK FOR UPDATES"
             textSize = 10.5f
@@ -169,15 +285,6 @@ class SettingsDialog(
             setOnClickListener { onCheckUpdates() }
         }
         content.addView(checkUpdates, matchWrap().apply { topMargin = context.dp(8f) })
-
-        modelValue = addSelector(content, "LIVE MODEL", JarvisPrefs.modelLabel()) { valueView ->
-            val labels = JarvisPrefs.models.map { it.label }
-            val checked = JarvisPrefs.models.indexOfFirst { it.id == selectedModel }.coerceAtLeast(0)
-            showChoice("Live model", labels, checked) { index ->
-                selectedModel = JarvisPrefs.models[index].id
-                valueView.text = labels[index]
-            }
-        }
 
         voiceValue = addSelector(content, "VOICE", selectedVoice) { valueView ->
             showVoiceChooser(valueView)
@@ -248,7 +355,7 @@ class SettingsDialog(
         modeRow.addView(modeToggle, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         content.addView(modeRow, matchWrap().apply { topMargin = context.dp(8f) })
         content.addView(
-            helperText("When on, Jarvis uses a stronger prompt to drop refusals and disclaimers. Gemini's built-in safety may still block some topics. Applies to the next live session."),
+            helperText("When on, Jarvis uses a stronger prompt to drop refusals and disclaimers. Voice still runs on Gemini, whose safety filter may block some topics. Text, deep research and uncensored answers run on Groq."),
             matchWrap().apply { topMargin = context.dp(8f) }
         )
 
@@ -568,6 +675,50 @@ class SettingsDialog(
             .show()
     }
 
+    private fun saveApiKeys() {
+        JarvisPrefs.apiKey = keyInput.text.toString()
+        JarvisPrefs.model = selectedModel
+        JarvisPrefs.groqApiKey = groqKeyInput.text.toString()
+        JarvisPrefs.groqModel = selectedGroqModel
+        Toast.makeText(context, "API keys saved", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun showGroqModelChooser(valueView: TextView) {
+        val key = groqKeyInput.text.toString().trim()
+        if (groqModels.isNotEmpty() && groqModelsKey == key) {
+            presentGroqChoices(valueView)
+            return
+        }
+        if (key.isBlank()) {
+            groqModels = JarvisPrefs.groqFallbackModels
+            groqModelsKey = key
+            presentGroqChoices(valueView)
+            return
+        }
+        Toast.makeText(context, "Fetching Groq models…", Toast.LENGTH_SHORT).show()
+        Thread {
+            val fetched = GroqClient.fetchModels(key)
+            main.post {
+                if (!isShowing) return@post
+                groqModels = if (fetched.isNotEmpty()) fetched else JarvisPrefs.groqFallbackModels
+                groqModelsKey = key
+                if (fetched.isEmpty()) {
+                    Toast.makeText(context, "Could not fetch models — showing defaults", Toast.LENGTH_SHORT).show()
+                }
+                presentGroqChoices(valueView)
+            }
+        }.start()
+    }
+
+    private fun presentGroqChoices(valueView: TextView) {
+        val items = groqModels.ifEmpty { JarvisPrefs.groqFallbackModels }
+        val checked = items.indexOf(selectedGroqModel).coerceAtLeast(0)
+        showChoice("Groq model", items, checked) { index ->
+            selectedGroqModel = items[index]
+            valueView.text = items[index]
+        }
+    }
+
     private fun selectOrb(index: Int) {
         selectedOrb = index
         orbCells.forEachIndexed { cellIndex, cell ->
@@ -588,6 +739,8 @@ class SettingsDialog(
         stopPreview()
         JarvisPrefs.apiKey = keyInput.text.toString()
         JarvisPrefs.model = selectedModel
+        JarvisPrefs.groqApiKey = groqKeyInput.text.toString()
+        JarvisPrefs.groqModel = selectedGroqModel
         JarvisPrefs.voice = selectedVoice
         JarvisPrefs.additionalInstructions = instructionInput.text.toString()
         JarvisPrefs.orbStyle = selectedOrb

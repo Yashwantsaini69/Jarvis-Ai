@@ -13,7 +13,8 @@ object ChatStore {
         val role: Role,
         var text: String,
         var final: Boolean,
-        val time: Long
+        val time: Long,
+        var source: String = ""
     )
 
     fun interface Listener {
@@ -131,6 +132,30 @@ object ChatStore {
         persist()
     }
 
+    fun addUserText(text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        synchronized(this) {
+            finalizeAssistantLocked()
+            finalizeUserLocked()
+            resetUserLocked()
+            val id = nextId++
+            messages.add(Message(id, Role.USER, clean, true, System.currentTimeMillis()))
+        }
+        notifyListeners()
+        persist()
+    }
+
+    fun setAssistantSource(source: String) {
+        if (source.isBlank()) return
+        synchronized(this) {
+            val id = assistantId ?: return@synchronized
+            messages.firstOrNull { it.id == id }?.source = source
+        }
+        notifyListeners()
+        persist()
+    }
+
     fun interrupted() {
         synchronized(this) {
             finalizeAssistantLocked()
@@ -219,6 +244,7 @@ object ChatStore {
                     .put("text", msg.text)
                     .put("final", msg.final)
                     .put("time", msg.time)
+                    .put("source", msg.source)
             )
         }
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -241,7 +267,16 @@ object ChatStore {
                 val role = if (obj.optString("role") == Role.USER.name) Role.USER else Role.ASSISTANT
                 val text = obj.optString("text", "")
                 if (text.isBlank()) continue
-                loaded.add(Message(id, role, text, true, obj.optLong("time", 0L)))
+                loaded.add(
+                    Message(
+                        id,
+                        role,
+                        text,
+                        true,
+                        obj.optLong("time", 0L),
+                        obj.optString("source", "")
+                    )
+                )
                 if (id > maxId) maxId = id
             }
             synchronized(this) {
