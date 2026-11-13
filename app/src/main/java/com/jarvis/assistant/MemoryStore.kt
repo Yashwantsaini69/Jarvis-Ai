@@ -4,14 +4,16 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import java.util.UUID
 
 private const val DB_NAME = "jarvis_memory.db"
-private const val DB_VERSION = 1
+private const val DB_VERSION = 2
 private const val TABLE_MEMORIES = "memories"
 private const val TABLE_META = "meta"
 private const val MAX_ROWS = 300
 private const val META_SIGNATURE = "last_processed_signature"
 private const val SOURCE_VOICE = "voice"
+private const val SOURCE_MANUAL = "manual"
 
 private const val RANK_ORDER = "importance DESC, updated_at DESC"
 
@@ -71,13 +73,19 @@ private val TARGET_KEYWORDS: Map<String, Pair<String, String?>> = mapOf(
 
 object MemoryStore {
 
+    val categories = listOf(
+        "Personal", "Preferences", "Work", "Study", "Important Notes", "Other"
+    )
+
     data class MemoryItem(
         val id: Long,
         val type: String,
         val key: String,
         val value: String,
         val importance: Int,
-        val updatedAt: Long
+        val updatedAt: Long,
+        val title: String = "",
+        val category: String = ""
     )
 
     private val lock = Any()
@@ -136,7 +144,7 @@ object MemoryStore {
             val cursor = try {
                 db.query(
                     TABLE_MEMORIES,
-                    arrayOf("id", "type", "key", "value", "importance", "updated_at"),
+                    arrayOf("id", "type", "key", "value", "importance", "updated_at", "title", "category"),
                     null, null, null, null, RANK_ORDER, "60"
                 )
             } catch (_: Exception) {
@@ -144,16 +152,7 @@ object MemoryStore {
             }
             cursor.use {
                 while (it.moveToNext()) {
-                    out.add(
-                        MemoryItem(
-                            it.getLong(0),
-                            it.getString(1),
-                            it.getString(2),
-                            it.getString(3),
-                            it.getInt(4),
-                            it.getLong(5)
-                        )
-                    )
+                    out.add(readItem(it))
                 }
             }
             out
@@ -162,7 +161,11 @@ object MemoryStore {
 
         val grouped = LinkedHashMap<String, MutableList<MemoryItem>>()
         for (item in items) {
-            grouped.getOrPut(labelFor(item)) { mutableListOf() }.add(item)
+            grouped.getOrPut(displayCategory(item)) { mutableListOf() }.add(item)
+        }
+        val ordered = grouped.entries.sortedBy { entry ->
+            val index = categories.indexOf(entry.key)
+            if (index < 0) categories.size else index
         }
 
         val header = "PERSISTENT MEMORY about the user from earlier conversations. " +
@@ -171,13 +174,19 @@ object MemoryStore {
         val body = StringBuilder()
         val used = mutableListOf<Long>()
 
-        for ((label, values) in grouped) {
-            val full = values.joinToString(", ") { it.value }
-            val shown = if (full.length > 220) full.take(217).trimEnd() + "..." else full
-            val line = "- $label: $shown"
-            if (header.length + body.length + line.length + 1 > maxChars) break
-            body.append(line).append('\n')
-            if (shown == full) values.forEach { used.add(it.id) }
+        for ((category, values) in ordered) {
+            val categoryLine = "[$category]"
+            if (header.length + body.length + categoryLine.length + 2 > maxChars) break
+            body.append(categoryLine).append('\n')
+            for (item in values) {
+                val title = displayTitle(item)
+                val full = item.value.trim()
+                val shown = if (full.length > 220) full.take(217).trimEnd() + "..." else full
+                val line = "- $title: $shown"
+                if (header.length + body.length + line.length + 2 > maxChars) break
+                body.append(line).append('\n')
+                if (shown == full) used.add(item.id)
+            }
         }
         if (body.length == 0) return ""
 
@@ -202,7 +211,7 @@ object MemoryStore {
             val cursor = try {
                 db.query(
                     TABLE_MEMORIES,
-                    arrayOf("id", "type", "key", "value", "importance", "updated_at"),
+                    arrayOf("id", "type", "key", "value", "importance", "updated_at", "title", "category"),
                     null, null, null, null, RANK_ORDER
                 )
             } catch (_: Exception) {
@@ -210,19 +219,76 @@ object MemoryStore {
             }
             cursor.use {
                 while (it.moveToNext()) {
-                    out.add(
-                        MemoryItem(
-                            it.getLong(0),
-                            it.getString(1),
-                            it.getString(2),
-                            it.getString(3),
-                            it.getInt(4),
-                            it.getLong(5)
-                        )
-                    )
+                    out.add(readItem(it))
                 }
             }
             out
+        }
+    }
+
+    fun addManual(title: String, content: String, category: String): Long {
+        val db = writable() ?: return -1L
+        val cleanTitle = title.trim().take(120)
+        val cleanContent = content.trim().take(2000)
+        if (cleanTitle.isBlank() || cleanContent.isBlank()) return -1L
+        val chosen = category.trim().ifBlank { "Other" }
+        val safeCategory = categories.firstOrNull { it.equals(chosen, ignoreCase = true) } ?: "Other"
+        val now = System.currentTimeMillis()
+        val key = "manual:" + UUID.randomUUID().toString().take(12)
+        return synchronized(lock) {
+            try {
+                val values = ContentValues().apply {
+                    put("type", typeForCategory(safeCategory))
+                    put("key", key)
+                    put("value", cleanContent)
+                    put("importance", 3)
+                    put("confidence", 1.0)
+                    put("source", SOURCE_MANUAL)
+                    put("created_at", now)
+                    put("updated_at", now)
+                    put("last_used_at", 0L)
+                    put("title", cleanTitle)
+                    put("category", safeCategory)
+                }
+                val id = db.insert(TABLE_MEMORIES, null, values)
+                if (id > 0) prune(db)
+                id
+            } catch (_: Exception) {
+                -1L
+            }
+        }
+    }
+
+    fun updateMemory(id: Long, title: String, content: String, category: String): Boolean {
+        val db = writable() ?: return false
+        val cleanTitle = title.trim().take(120)
+        val cleanContent = content.trim().take(2000)
+        if (cleanTitle.isBlank() || cleanContent.isBlank()) return false
+        val chosen = category.trim().ifBlank { "Other" }
+        val safeCategory = categories.firstOrNull { it.equals(chosen, ignoreCase = true) } ?: "Other"
+        return synchronized(lock) {
+            try {
+                val values = ContentValues().apply {
+                    put("title", cleanTitle)
+                    put("value", cleanContent)
+                    put("category", safeCategory)
+                    put("updated_at", System.currentTimeMillis())
+                }
+                db.update(TABLE_MEMORIES, values, "id = ?", arrayOf(id.toString())) > 0
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
+    fun deleteMemory(id: Long): Boolean {
+        val db = writable() ?: return false
+        return synchronized(lock) {
+            try {
+                db.delete(TABLE_MEMORIES, "id = ?", arrayOf(id.toString())) > 0
+            } catch (_: Exception) {
+                false
+            }
         }
     }
 
@@ -389,23 +455,81 @@ object MemoryStore {
         return found.values.toList()
     }
 
-    private fun labelFor(item: MemoryItem): String = when (item.type) {
-        "identity" -> when (item.key) {
-            "name" -> "Name"
-            "birthday" -> "Birthday"
-            else -> "Identity"
+    private fun readItem(cursor: android.database.Cursor): MemoryItem = MemoryItem(
+        cursor.getLong(0),
+        cursor.getString(1),
+        cursor.getString(2),
+        cursor.getString(3),
+        cursor.getInt(4),
+        cursor.getLong(5),
+        cursor.getString(6) ?: "",
+        cursor.getString(7) ?: ""
+    )
+
+    fun displayTitle(item: MemoryItem): String {
+        val stored = item.title.trim()
+        if (stored.isNotEmpty()) return stored
+        return when (item.type) {
+            "identity" -> when (item.key) {
+                "name" -> "Name"
+                "birthday" -> "Birthday"
+                else -> "Identity"
+            }
+            "location" -> if (item.key == "city") "City" else "Location"
+            "work" -> "Work"
+            "education" -> "Education"
+            "preference" -> when {
+                item.key.startsWith("like:") ->
+                    "Like: " + humanizeSlot(item.key.removePrefix("like:"))
+                item.key.startsWith("dislike:") ->
+                    "Dislike: " + humanizeSlot(item.key.removePrefix("dislike:"))
+                else -> "Preference"
+            }
+            "project" -> "Project: " + humanizeSlot(item.key.removePrefix("project:"))
+            "note" -> {
+                val slot = humanizeSlot(item.key.removePrefix("note:"))
+                if (slot.isBlank() || slot.equals("Entry", ignoreCase = true)) "Note" else "Note: $slot"
+            }
+            else -> {
+                val slot = humanizeSlot(item.key)
+                if (slot.isNotBlank()) {
+                    slot
+                } else {
+                    item.type.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+                }
+            }
         }
-        "location" -> if (item.key == "city") "City" else "Location"
-        "work" -> "Work"
-        "education" -> "Education"
-        "preference" -> when {
-            item.key.startsWith("like:") -> "Likes"
-            item.key.startsWith("dislike:") -> "Dislikes"
-            else -> "Preferences"
+    }
+
+    private fun humanizeSlot(raw: String): String = raw
+        .replace('-', ' ')
+        .replace('_', ' ')
+        .trim()
+        .replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+        .take(40)
+
+    fun displayCategory(item: MemoryItem): String {
+        val stored = item.category.trim()
+        if (stored.isNotEmpty()) {
+            return categories.firstOrNull { it.equals(stored, ignoreCase = true) } ?: "Other"
         }
-        "project" -> "Projects"
-        "note" -> "Notes"
-        else -> item.type.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+        return when (item.type) {
+            "identity", "location" -> "Personal"
+            "preference" -> "Preferences"
+            "work", "project" -> "Work"
+            "education" -> "Study"
+            "note" -> "Important Notes"
+            else -> "Other"
+        }
+    }
+
+    private fun typeForCategory(category: String): String = when (category) {
+        "Personal" -> "identity"
+        "Preferences" -> "preference"
+        "Work" -> "work"
+        "Study" -> "education"
+        "Important Notes", "Other" -> "note"
+        else -> "note"
     }
 
     private fun touch(db: SQLiteDatabase, ids: List<Long>) {
@@ -461,6 +585,8 @@ object MemoryStore {
                     "created_at INTEGER NOT NULL," +
                     "updated_at INTEGER NOT NULL," +
                     "last_used_at INTEGER NOT NULL DEFAULT 0," +
+                    "title TEXT NOT NULL DEFAULT ''," +
+                    "category TEXT NOT NULL DEFAULT ''," +
                     "UNIQUE(type, key))"
             )
             db.execSQL("CREATE TABLE $TABLE_META (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -470,9 +596,10 @@ object MemoryStore {
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            db.execSQL("DROP TABLE IF EXISTS $TABLE_MEMORIES")
-            db.execSQL("DROP TABLE IF EXISTS $TABLE_META")
-            onCreate(db)
+            if (oldVersion < 2) {
+                db.execSQL("ALTER TABLE $TABLE_MEMORIES ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE $TABLE_MEMORIES ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+            }
         }
     }
 }

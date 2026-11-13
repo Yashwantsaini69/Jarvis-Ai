@@ -187,6 +187,27 @@ class SettingsDialog(
             matchWrap().apply { topMargin = context.dp(8f) }
         )
 
+        val memoryRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = context.roundedBackground(Palette.panel, withAlpha(Palette.cyan, 0.18f), 15f, 1f)
+            setPadding(context.dp(14f), context.dp(13f), context.dp(14f), context.dp(13f))
+            isClickable = true
+            contentDescription = "Open memory manager"
+            setOnClickListener { MemoryManagerDialog(context).show() }
+        }
+        val memoryText = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+        memoryText.addView(context.label("MEMORY MANAGER", 12f, Palette.ice, 0.12f, true))
+        memoryText.addView(
+            context.label("View, add, edit or delete long-term memories", 10f, Palette.textFaint, 0.02f),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = context.dp(3f)
+            }
+        )
+        memoryRow.addView(memoryText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        memoryRow.addView(context.label("›", 18f, Palette.cyan, 0f, true))
+        content.addView(memoryRow, matchWrap().apply { topMargin = context.dp(18f) })
+
         addSection(content, "RESPONSE MODE")
         val modeRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL

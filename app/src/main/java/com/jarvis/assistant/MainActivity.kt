@@ -38,6 +38,8 @@ class MainActivity : Activity() {
     private var micMuted = false
     private var connectionWatchdog: Runnable? = null
     private var updatePromptVisible = false
+    private var connectedSoundPlayed = false
+    private var disconnectedSoundPlayed = false
 
     private val chatListener = ChatStore.Listener {
         runOnUiThread { updateLatest() }
@@ -232,6 +234,8 @@ class MainActivity : Activity() {
         connecting = true
         active = false
         stopRequested = false
+        connectedSoundPlayed = false
+        disconnectedSoundPlayed = false
         uiMode = UiMode.CONNECTING
         orb.mode = OrbView.Mode.CONNECTING
         orb.setLevel(0f)
@@ -289,6 +293,7 @@ class MainActivity : Activity() {
 
     private fun endSession() {
         stopRequested = true
+        playDisconnectSoundOnce()
         releaseSession()
         ChatStore.sessionActive = false
         ChatStore.assistantDone()
@@ -313,7 +318,14 @@ class MainActivity : Activity() {
         active = false
     }
 
+    private fun playDisconnectSoundOnce() {
+        if (!connectedSoundPlayed || disconnectedSoundPlayed) return
+        disconnectedSoundPlayed = true
+        ConnectionSounds.playDisconnected()
+    }
+
     private fun endWithError(title: String, message: String) {
+        playDisconnectSoundOnce()
         JarvisSessionService.stop(this)
         releaseSession()
         ChatStore.sessionActive = false
@@ -510,6 +522,10 @@ class MainActivity : Activity() {
                 "Previous session restored — listening"
             } else {
                 "Listening — speak naturally"
+            }
+            if (!connectedSoundPlayed) {
+                connectedSoundPlayed = true
+                ConnectionSounds.playConnected()
             }
             if (ChatStore.latest() == null) {
                 latest.text = "Say “Jarvis, are you there?”"
