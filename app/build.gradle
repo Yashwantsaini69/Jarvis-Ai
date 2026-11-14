@@ -8,10 +8,11 @@ android {
     compileSdk 35
     defaultConfig {
         applicationId 'com.jarvis.assistant'
-        minSdk 24
+        minSdk 26
         targetSdk 35
-        versionCode 40
-        versionName '3.18'
+        versionCode 54
+        versionName '3.32'
+        ndk { abiFilters 'arm64-v8a' }
     }
     signingConfigs {
         release {
@@ -36,6 +37,11 @@ android {
             }
         }
     }
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
     lint {
         checkReleaseBuilds false
         abortOnError false
@@ -51,4 +57,5 @@ dependencies {
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     implementation 'androidx.core:core:1.13.1'
     implementation 'org.jsoup:jsoup:1.18.1'
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.17.1'
 }

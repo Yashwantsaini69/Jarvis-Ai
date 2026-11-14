@@ -74,6 +74,8 @@ class AudioEngine(
         playback.clear()
     }
 
+    fun isPlaybackIdle(): Boolean = playback.isIdle()
+
     fun release() {
         stopCapture()
         playback.release()
@@ -134,6 +136,9 @@ class AudioEngine(
         @Volatile
         private var track: AudioTrack? = null
 
+        @Volatile
+        private var framesWritten = 0L
+
         private val worker = Thread({ loop() }, "jarvis-playback").apply {
             priority = Thread.MAX_PRIORITY
             isDaemon = true
@@ -146,6 +151,7 @@ class AudioEngine(
 
         fun clear() {
             queue.clear()
+            framesWritten = 0L
             val t = track ?: return
             try {
                 t.pause()
@@ -153,6 +159,18 @@ class AudioEngine(
                 t.play()
             } catch (_: Throwable) {
             }
+        }
+
+        fun isIdle(): Boolean {
+            if (!queue.isEmpty()) return false
+            val t = track ?: return true
+            val written = framesWritten
+            val played = try {
+                t.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+            } catch (_: Throwable) {
+                return true
+            }
+            return played >= written - 1024L
         }
 
         fun release() {
@@ -214,6 +232,7 @@ class AudioEngine(
                     }
                     if (written <= 0) break
                     offset += written
+                    framesWritten += written / 2
                 }
                 onLevel(levelOf(chunk))
             }

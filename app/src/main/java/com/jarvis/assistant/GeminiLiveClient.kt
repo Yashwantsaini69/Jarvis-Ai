@@ -39,6 +39,7 @@ class GeminiLiveClient(
         fun onGoAway(secondsLeft: Long)
         fun onSessionResumption(handle: String, resumable: Boolean) {}
         fun onAppCommand(name: String) {}
+        fun onDeviceAction(name: String, args: JSONObject, id: String) {}
         fun onClosed(reason: String)
         fun onError(message: String)
     }
@@ -112,6 +113,10 @@ class GeminiLiveClient(
         }
     }
 
+    fun respondToDevice(id: String, name: String, result: String) {
+        sendToolResponse(id, name, result)
+    }
+
     fun close() {
         closed = true
         val ws = webSocket
@@ -156,6 +161,10 @@ class GeminiLiveClient(
 
         val functions = appFunctionDeclarations()
         functions.put(searchFunctionDeclaration())
+        val deviceFunctions = deviceFunctionDeclarations()
+        for (i in 0 until deviceFunctions.length()) {
+            functions.put(deviceFunctions.get(i))
+        }
         val tools = JSONArray().put(
             JSONObject().put("functionDeclarations", functions)
         )
@@ -209,6 +218,36 @@ class GeminiLiveClient(
         name == "unmute_mic" ||
         name == "go_back"
 
+    private fun deviceFunctionDeclarations(): JSONArray = JSONArray().apply {
+        put(deviceFunction("open_app", "Open an installed app on the phone by name, for example WhatsApp, YouTube, Chrome or Settings.", "app", "App name"))
+        put(deviceFunction("open_url", "Open a website or run a web search in the phone browser.", "url", "Website URL or search query"))
+    }
+
+    private fun deviceFunction(
+        name: String,
+        description: String,
+        param: String,
+        paramDescription: String
+    ): JSONObject = JSONObject()
+        .put("name", name)
+        .put("description", description)
+        .put(
+            "parameters",
+            JSONObject()
+                .put("type", "OBJECT")
+                .put(
+                    "properties",
+                    JSONObject().put(
+                        param,
+                        JSONObject().put("type", "STRING").put("description", paramDescription)
+                    )
+                )
+                .put("required", JSONArray().put(param))
+        )
+
+    private fun isDeviceFunction(name: String): Boolean = name == "open_app" ||
+        name == "open_url"
+
     private fun searchFunctionDeclaration(): JSONObject {
         val declaration = JSONObject()
             .put("name", "web_search")
@@ -246,6 +285,9 @@ class GeminiLiveClient(
             if (isAppFunction(name)) {
                 handler.post { listener.onAppCommand(name) }
                 sendToolResponse(id, name, "ok")
+            } else if (isDeviceFunction(name)) {
+                val args = call.optJSONObject("args") ?: JSONObject()
+                handler.post { listener.onDeviceAction(name, args, id) }
             } else if (name != "web_search") {
                 sendToolResponse(id, name, "Unknown tool: $name")
             } else {

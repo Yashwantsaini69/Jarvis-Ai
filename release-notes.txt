@@ -1,0 +1,22 @@
+JARVIS AI 3.32 — Help button
+
+WHAT'S NEW
+- Settings: SAVE CONFIGURATION is slightly shorter on the right.
+- A new "?" HELP button sits next to it.
+- Help explains every feature in simple English.
+- No UPDATES section in Help. Each release note explains how to use the update.
+
+HOW TO USE THIS UPDATE
+1. Install this APK over the old Jarvis (same signing key).
+2. Open Jarvis Settings.
+3. Tap the "?" button next to SAVE CONFIGURATION.
+4. Scroll the help to read any feature.
+
+VOICE UNMUTE (from 3.31)
+- Say "mute karo" to mute.
+- While muted, say "Hey Jarvis" to unmute without touching the screen.
+- When the app is fully closed, Jarvis does not listen.
+
+BACKGROUND APP CONTROL
+- Allow "Display over other apps" in Settings.
+- Then "YouTube kholo" and "WhatsApp kholo" work while Jarvis stays in the background.

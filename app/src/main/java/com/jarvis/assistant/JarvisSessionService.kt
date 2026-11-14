@@ -68,37 +68,51 @@ class JarvisSessionService : Service() {
         manager.createNotificationChannel(channel)
     }
 
-    private fun buildNotification(): Notification {
-        val open = Intent(this, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        }
-        val pending = PendingIntent.getActivity(
-            this,
-            0,
-            open,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-        }
-        return builder
-            .setSmallIcon(R.drawable.ic_mic)
-            .setContentTitle("Jarvis is live")
-            .setContentText("Voice link active — tap to return")
-            .setContentIntent(pending)
-            .setOngoing(true)
-            .setShowWhen(false)
-            .setCategory(Notification.CATEGORY_SERVICE)
-            .build()
-    }
+    private fun buildNotification(muted: Boolean = false): Notification =
+        buildNotification(this, muted)
 
     companion object {
         private const val CHANNEL_ID = "jarvis_live_session"
         private const val NOTIFICATION_ID = 4310
         private const val ACTION_STOP = "com.jarvis.assistant.STOP_SESSION"
+
+        fun setMuted(context: Context, muted: Boolean) {
+            val manager = context.getSystemService(NotificationManager::class.java) ?: return
+            try {
+                manager.notify(NOTIFICATION_ID, buildNotification(context, muted))
+            } catch (_: Throwable) {
+            }
+        }
+
+        private fun buildNotification(context: Context, muted: Boolean): Notification {
+            val open = Intent(context, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            }
+            val pending = PendingIntent.getActivity(
+                context,
+                0,
+                open,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Notification.Builder(context, CHANNEL_ID)
+            } else {
+                @Suppress("DEPRECATION")
+                Notification.Builder(context)
+            }
+            return builder
+                .setSmallIcon(if (muted) R.drawable.ic_mic_off else R.drawable.ic_mic)
+                .setContentTitle(if (muted) "Jarvis is muted" else "Jarvis is live")
+                .setContentText(
+                    if (muted) "Say \"Hey Jarvis\" to unmute"
+                    else "Voice link active — tap to return"
+                )
+                .setContentIntent(pending)
+                .setOngoing(true)
+                .setShowWhen(false)
+                .setCategory(Notification.CATEGORY_SERVICE)
+                .build()
+        }
 
         fun start(context: Context) {
             val intent = Intent(context, JarvisSessionService::class.java)

@@ -3,10 +3,13 @@ package com.jarvis.assistant
 import android.app.AlertDialog
 import android.app.Dialog
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -36,6 +39,75 @@ class SettingsDialog(
     private val orbCells = mutableListOf<LinearLayout>()
     private var preview: VoicePreview? = null
     private var previewToken = 0
+
+    private val helpText = """
+        JARVIS HELP
+
+        TALK
+        - Open the app. Jarvis connects automatically and starts listening.
+        - Speak normally. Jarvis answers with voice.
+        - The live session keeps running when you go to another app.
+        - Tap the orb to start or end the session.
+        - Open the chat to see the transcript or type a message.
+
+        MUTE AND UNMUTE
+        - Say "mute karo" or "mic off karo" to mute.
+        - While muted, say "Hey Jarvis" to unmute. No touch needed.
+        - The "Hey Jarvis" detector works only while muted and only on this device.
+        - When the app is fully closed, Jarvis does not listen.
+
+        OPEN APPS AND LINKS
+        - "YouTube kholo", "WhatsApp kholo", "Chrome kholo".
+        - "Chrome me google.com kholo" or "open google.com".
+        - To open apps while Jarvis is in the background, allow
+          "Display over other apps" in Settings.
+
+        APP CONTROLS
+        - "Chat kholo", "chat band karo", "chat clear karo".
+        - "Settings kholo" opens Jarvis settings.
+        - "Phone settings kholo" opens Android settings.
+        - "Memory manager kholo", "notes kholo", "multi brain kholo".
+        - "Back karo" and "home screen par aao" work inside Jarvis.
+        - "Bluetooth on karo" or "WiFi band karo". Android may open a system panel.
+        - These commands run silently, without a spoken reply.
+
+        REMINDERS
+        - "Reminder set karo 5 baje", "reminder tomorrow 9 am",
+          "reminder 16 nov 1 am".
+        - English, Hindi and Hinglish are supported.
+        - Jarvis saves the reminder, sets an alarm, and confirms naturally.
+        - Reminders are restored after a restart.
+
+        MEMORY
+        - Jarvis remembers useful facts about you over time.
+        - Open MEMORY MANAGER to view, add, edit, delete or clear memories.
+        - These memories are used in future conversations.
+
+        NOTEPAD
+        - Open the notepad from the main screen or say "notes kholo".
+        - Write quick notes and set a reminder for any note.
+
+        MULTI-BRAIN
+        - Open MULTI BRAIN MANAGER to add API keys and models for:
+          Gemini Live, Groq and Uncensored AI.
+
+        SETTINGS
+        - RESPONSE MODE: turn Uncensored mode ON or OFF.
+        - VOICE: choose and preview Jarvis's voice.
+        - SYSTEM INSTRUCTIONS: add your own rules for how Jarvis should talk.
+        - ORB DESIGN: choose the centre animation.
+        - VOICE CONTROL: explains mute and "Hey Jarvis" unmute.
+        - CHECK FOR UPDATES: looks for a new Jarvis APK.
+        - SAVE CONFIGURATION: saves your changes.
+
+        PRIVACY
+        - Your API keys and settings stay on this device.
+        - During a live session, your voice is sent to Gemini for the conversation.
+        - While muted, no audio is sent to Gemini. The local "Hey Jarvis"
+          detector is only for unmuting.
+        - Jarvis does not read your screen. "Display over other apps" is only
+          used to open apps from the background.
+    """.trimIndent()
 
     init {
         requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -189,6 +261,81 @@ class SettingsDialog(
         refreshModeToggle()
         modeRow.addView(modeToggle, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         content.addView(modeRow, matchWrap().apply { topMargin = context.dp(8f) })
+
+        addSection(content, "BACKGROUND APP CONTROL")
+        val overlayAllowed = Settings.canDrawOverlays(context)
+        val overlayRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = context.roundedBackground(
+                Palette.panelSoft,
+                withAlpha(Palette.cyan, 0.25f),
+                15f,
+                1f
+            )
+            setPadding(context.dp(14f), context.dp(12f), context.dp(14f), context.dp(12f))
+            isClickable = true
+        }
+        val overlayText = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+        overlayText.addView(context.label("Display over other apps", 13.5f, Palette.ice, 0.01f))
+        overlayText.addView(
+            context.label(
+                "Open another app while Jarvis is in the background",
+                10f,
+                Palette.textFaint,
+                0.02f
+            ),
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = context.dp(3f) }
+        )
+        overlayRow.addView(
+            overlayText,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        overlayRow.addView(
+            context.label(
+                if (overlayAllowed) "ALLOWED" else "SET",
+                10.5f,
+                Palette.cyan,
+                0.12f,
+                true,
+                Gravity.CENTER
+            )
+        )
+        overlayRow.setOnClickListener {
+            try {
+                context.startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${context.packageName}")
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (_: Throwable) {
+                try {
+                    context.startActivity(
+                        Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:${context.packageName}")
+                        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        content.addView(overlayRow, matchWrap().apply { topMargin = context.dp(8f) })
+        content.addView(
+            helperText("Required for \"WhatsApp kholo\" after YouTube. Android may show a Play Protect warning for this permission; Jarvis never reads your screen."),
+            matchWrap().apply { topMargin = context.dp(8f) }
+        )
+
+        addSection(content, "VOICE CONTROL")
+        content.addView(
+            helperText("While muted, say \u201cHey Jarvis\u201d to unmute. Jarvis only listens for this locally during a muted live session; there is no background wake service."),
+            matchWrap().apply { topMargin = context.dp(8f) }
+        )
+
         addSection(content, "SYSTEM INSTRUCTIONS")
         val instructionHeader = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -287,6 +434,10 @@ class SettingsDialog(
             })
         }
 
+        val saveRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         val save = TextView(context).apply {
             text = "SAVE CONFIGURATION"
             textSize = 12.5f
@@ -305,7 +456,31 @@ class SettingsDialog(
             isClickable = true
             setOnClickListener { save() }
         }
-        content.addView(save, matchWrap().apply { topMargin = context.dp(28f) })
+        saveRow.addView(save, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        val help = TextView(context).apply {
+            text = "?"
+            textSize = 20f
+            typeface = context.font(20f, true)
+            gravity = Gravity.CENTER
+            setTextColor(Palette.cyan)
+            background = context.roundedBackground(
+                Palette.panelSoft,
+                withAlpha(Palette.cyan, 0.55f),
+                16f,
+                1.2f
+            )
+            contentDescription = "Open Jarvis help"
+            isClickable = true
+            setOnClickListener { showHelp() }
+        }
+        saveRow.addView(
+            help,
+            LinearLayout.LayoutParams(context.dp(52f), context.dp(52f)).apply {
+                marginStart = context.dp(10f)
+            }
+        )
+        content.addView(saveRow, matchWrap().apply { topMargin = context.dp(28f) })
 
         content.addView(
             context.label(
@@ -337,6 +512,52 @@ class SettingsDialog(
             window.statusBarColor = Palette.bg
             window.navigationBarColor = Palette.bg
         }
+    }
+
+    private fun showHelp() {
+        val dialog = Dialog(context)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val root = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(context.dp(22f), context.dp(20f), context.dp(22f), context.dp(16f))
+            background = context.roundedBackground(Palette.bg, withAlpha(Palette.cyan, 0.45f), 22f, 1.2f)
+        }
+        root.addView(context.label("JARVIS HELP", 19f, Palette.ice, 0.22f, true))
+        root.addView(
+            context.label("All features in simple English", 9.5f, Palette.cyanDim, 0.18f),
+            matchWrap().apply { topMargin = context.dp(3f) }
+        )
+        val scroll = ScrollView(context).apply {
+            isFillViewport = false
+            clipToPadding = false
+        }
+        val body = context.label(helpText, 12.5f, Palette.ice).apply {
+            setLineSpacing(context.dpf(4f), 1f)
+            setTextIsSelectable(true)
+            setPadding(0, context.dp(14f), 0, context.dp(14f))
+        }
+        scroll.addView(body, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val close = TextView(context).apply {
+            text = "CLOSE"
+            textSize = 11f
+            letterSpacing = 0.2f
+            typeface = context.font(11f, true)
+            gravity = Gravity.CENTER
+            setTextColor(Palette.cyan)
+            background = context.roundedBackground(Palette.panel, withAlpha(Palette.cyan, 0.4f), 15f, 1f)
+            setPadding(0, context.dp(12f), 0, context.dp(12f))
+            isClickable = true
+            setOnClickListener { dialog.dismiss() }
+        }
+        root.addView(close, matchWrap().apply { topMargin = context.dp(10f) })
+        dialog.setContentView(root)
+        dialog.setOnShowListener {
+            root.applySystemBarPadding()
+        }
+        dialog.show()
+        dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
     }
 
     private fun addSection(parent: LinearLayout, title: String) {

@@ -53,29 +53,34 @@ jobs:
         run: |
           set -e
           cp "app/build/outputs/apk/release/app-release.apk" Jarvis.apk
-          SHA=$(sha256sum Jarvis.apk | awk '{print $1}')
-          VERSION_CODE=$(grep -oE "versionCode [0-9]+" app/build.gradle | grep -oE "[0-9]+")
-          VERSION_NAME=$(grep -oE "versionName '[^']+'" app/build.gradle | sed "s/versionName '//; s/'//")
-          REPO="${{ github.repository }}"
-          cat > update.json <<EOF
-          {
-            "versionCode": ${VERSION_CODE},
-            "versionName": "${VERSION_NAME}",
-            "apkUrl": "https://github.com/${REPO}/releases/latest/download/Jarvis.apk",
-            "sha256": "${SHA}",
-            "notes": "JARVIS AI ${VERSION_NAME}",
-            "force": false,
-            "minVersionCode": 0
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          sha = hashlib.sha256(open("Jarvis.apk", "rb").read()).hexdigest()
+          gradle = open("app/build.gradle", encoding="utf-8").read()
+          code = int(re.search(r"versionCode\s+(\d+)", gradle).group(1))
+          name = re.search(r"versionName\s+'([^']+)'", gradle).group(1)
+          notes = open("release-notes.txt", encoding="utf-8").read().strip()
+          repo = os.environ["GITHUB_REPOSITORY"]
+          data = {
+              "versionCode": code,
+              "versionName": name,
+              "apkUrl": f"https://github.com/{repo}/releases/latest/download/Jarvis.apk",
+              "sha256": sha,
+              "notes": notes,
+              "force": False,
+              "minVersionCode": 0,
           }
-          EOF
-          cat update.json
+          with open("update.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          print(open("update.json", encoding="utf-8").read())
+          PY
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: JARVIS AI ${{ github.ref_name }}
+          body_path: release-notes.txt
           files: |
             Jarvis.apk
             update.json
-          generate_release_notes: true

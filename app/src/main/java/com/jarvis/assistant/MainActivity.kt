@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
@@ -23,6 +24,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -51,6 +53,11 @@ class MainActivity : Activity() {
     private var modalKey: String? = null
     private var lastActionName = ""
     private var lastActionAt = 0L
+    private var silentActionTurn = false
+    private var unmuteDetector: WakeDetector? = null
+    private var unmuteListening = false
+    private var unmuteStartToken = 0
+    private var lastAutoConnectAt = 0L
     private var lastNoteSignature = ""
     private var lastNoteAt = 0L
     private var lastReminderScheduledAt = 0L
@@ -59,7 +66,22 @@ class MainActivity : Activity() {
     private var lastReminderIntentAt = 0L
     private var lastReminderNoteId = 0L
     private var lastReminderRawText = ""
-    private var pendingConfirmNoteId = 0L
+    private var reminderFlowToken = 0
+    private var reminderAckAwaiting = false
+    private var reminderAckDone = false
+    private var reminderAckAudioSeen = false
+    private var reminderAckHeard = false
+    private var reminderAckStartedAt = 0L
+    private var reminderAckDoneAt = 0L
+    private var reminderAckPlaybackIdleAt = 0L
+    private var reminderSuccessAt = 0L
+    private var reminderSuccessNoteId = 0L
+    private var reminderFinalPending = false
+    private var reminderFinalScheduled = false
+    private var reminderFinalSent = false
+    private var reminderFailurePending = false
+    private var reminderFailureSent = false
+    private val reminderFinalPauseMs = 1600L
     private val reminderHandler = Handler(Looper.getMainLooper())
     private var pendingReminderText = ""
     private val parsePendingReminder = Runnable {
@@ -67,11 +89,10 @@ class MainActivity : Activity() {
         pendingReminderText = ""
         if (text.isNotBlank()) handleVoiceReminder(text)
     }
-    private val confirmReminderRunnable = Runnable {
-        val id = pendingConfirmNoteId
-        pendingConfirmNoteId = 0L
-        if (id > 0L) sendReminderConfirmation(id)
-    }
+    private val reminderFinalRunnable = Runnable { sendReminderSuccessConfirmation() }
+    private val reminderPlaybackCheck = Runnable { maybeScheduleReminderFinal() }
+    private val reminderAckTimeout = Runnable { if (reminderAckAwaiting) finishReminderAck() }
+    private val reminderFailureCheck = Runnable { maybeSpeakReminderFailure() }
     private val assistantTurnText = StringBuilder()
     private var connectionWatchdog: Runnable? = null
     private var updatePromptVisible = false
@@ -107,7 +128,7 @@ class MainActivity : Activity() {
         if (openNotesFromIntent) intent.removeExtra("open_notes")
         if (openNotesFromIntent) window.decorView.post { openNotes() }
         window.decorView.postDelayed({
-            if (!isFinishing && !isDestroyed && !active && !connecting) startFlow()
+            if (!isFinishing && !isDestroyed && !active && !connecting) autoConnectIfIdle()
         }, 150L)
         window.decorView.postDelayed({ checkForUpdates(manual = false) }, 1500L)
     }
@@ -123,6 +144,15 @@ class MainActivity : Activity() {
                 else "Add your Gemini API key in Settings"
         }
         updateLatest()
+        if (!active && !connecting) autoConnectIfIdle()
+    }
+
+    override fun onResume() {
+        super.onResume()
+    }
+
+    override fun onPause() {
+        super.onPause()
     }
 
     override fun onStop() {
@@ -131,11 +161,16 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        stopUnmuteDetector()
+        try {
+            unmuteDetector?.release()
+        } catch (_: Throwable) {
+        }
+        unmuteDetector = null
         ReminderBus.removeListener(reminderListener)
         reminderHandler.removeCallbacks(parsePendingReminder)
-        reminderHandler.removeCallbacks(confirmReminderRunnable)
         pendingReminderText = ""
-        pendingConfirmNoteId = 0L
+        resetReminderConfirmation()
         if (client != null || audio != null) {
             stopRequested = true
             releaseSession()
@@ -293,6 +328,21 @@ class MainActivity : Activity() {
         if (active || connecting) endSession() else startFlow()
     }
 
+    private fun autoConnectIfIdle() {
+        if (active || connecting || uiMode != UiMode.IDLE) return
+        if (!JarvisPrefs.hasApiKey()) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastAutoConnectAt < 3000L) return
+        lastAutoConnectAt = now
+        window.decorView.postDelayed({
+            if (!isFinishing && !isDestroyed && !active && !connecting &&
+                uiMode == UiMode.IDLE
+            ) {
+                startFlow()
+            }
+        }, 300L)
+    }
+
     private fun startFlow() {
         if (!JarvisPrefs.hasApiKey()) {
             toast("Add your Gemini API key in Settings")
@@ -336,6 +386,7 @@ class MainActivity : Activity() {
 
     private fun startSession() {
         if (active || connecting) return
+        stopUnmuteDetector()
         ChatStore.beginSession()
         ChatStore.sessionActive = true
         connecting = true
@@ -368,7 +419,9 @@ class MainActivity : Activity() {
         )
 
         val memoryBlock = MemoryStore.promptBlock()
-        val baseInstruction = JarvisPrefs.effectiveInstruction() + "\n\n" + APP_CONTROL_INSTRUCTION
+        val baseInstruction = JarvisPrefs.effectiveInstruction() + "\n\n" +
+            APP_CONTROL_INSTRUCTION + "\n\n" + DEVICE_CONTROL_INSTRUCTION + "\n\n" +
+            SILENT_COMMAND_INSTRUCTION
         val systemInstruction = if (memoryBlock.isBlank()) {
             baseInstruction
         } else {
@@ -397,9 +450,9 @@ class MainActivity : Activity() {
         client?.connect()
     }
 
-    private fun endSession() {
+    private fun endSession(silent: Boolean = false) {
         stopRequested = true
-        playDisconnectSoundOnce()
+        if (!silent) playDisconnectSoundOnce()
         releaseSession()
         ChatStore.sessionActive = false
         ChatStore.assistantDone()
@@ -411,10 +464,10 @@ class MainActivity : Activity() {
     }
 
     private fun releaseSession() {
+        stopUnmuteDetector()
         reminderHandler.removeCallbacks(parsePendingReminder)
-        reminderHandler.removeCallbacks(confirmReminderRunnable)
         pendingReminderText = ""
-        pendingConfirmNoteId = 0L
+        resetReminderConfirmation()
         connectionWatchdog?.let { orb.removeCallbacks(it) }
         connectionWatchdog = null
         val currentClient = client
@@ -493,18 +546,82 @@ class MainActivity : Activity() {
         if (micMuted == muted) return
         micMuted = muted
         updateMicButton()
+        JarvisSessionService.setMuted(this, muted)
         if (muted) {
+            audio?.stopCapture()
             orb.setLevel(0f)
-            if (active) {
+            if (active || connecting) {
                 statusLabel.text = "MUTED"
                 statusLabel.setTextColor(Palette.gold)
-                statusDetail.text = "Microphone off — tap the mic to speak"
+                statusDetail.text = MUTE_DETAIL
             }
-        } else if (active) {
-            orb.mode = OrbView.Mode.LISTENING
-            statusLabel.text = "ONLINE"
-            statusLabel.setTextColor(Palette.cyan)
-            statusDetail.text = "Listening — speak naturally"
+            startUnmuteDetector()
+        } else {
+            stopUnmuteDetector()
+            if (active) {
+                if (audio?.startCapture() == true) {
+                    orb.mode = OrbView.Mode.LISTENING
+                    statusLabel.text = "ONLINE"
+                    statusLabel.setTextColor(Palette.cyan)
+                    statusDetail.text = "Listening — speak naturally"
+                } else {
+                    micMuted = true
+                    updateMicButton()
+                    JarvisSessionService.setMuted(this, true)
+                    statusLabel.text = "MUTED"
+                    statusLabel.setTextColor(Palette.gold)
+                    statusDetail.text = MUTE_DETAIL
+                    orb.setLevel(0f)
+                    startUnmuteDetector()
+                    toast("Could not open the microphone")
+                }
+            }
+        }
+    }
+
+    private fun startUnmuteDetector() {
+        if (!micMuted || unmuteListening || (!active && !connecting)) return
+        if (audio == null) return
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
+        val detector = unmuteDetector ?: WakeDetector.Builder(this)
+            .setModel(WakeDetector.BuiltInModel.HEY_JARVIS)
+            .setThreshold(0.4f)
+            .setDebounceMs(2500L)
+            .build()
+            .also {
+                it.onError = { message ->
+                    Log.w("JarvisUnmute", "detector error: $message")
+                    unmuteListening = false
+                    if (micMuted && (active || connecting)) {
+                        statusDetail.text = "Voice unmute unavailable — tap the mic"
+                    }
+                }
+                unmuteDetector = it
+            }
+        unmuteListening = true
+        val token = ++unmuteStartToken
+        window.decorView.postDelayed({
+            if (token != unmuteStartToken || !micMuted || !unmuteListening) return@postDelayed
+            if (audio == null) {
+                unmuteListening = false
+                return@postDelayed
+            }
+            detector.start {
+                if (token != unmuteStartToken || !micMuted) return@start
+                unmuteListening = false
+                unmuteStartToken++
+                setMicMuted(false)
+                toast("Microphone on")
+            }
+        }, 650L)
+    }
+
+    private fun stopUnmuteDetector() {
+        unmuteListening = false
+        unmuteStartToken++
+        try {
+            unmuteDetector?.stop()
+        } catch (_: Throwable) {
         }
     }
 
@@ -525,10 +642,10 @@ class MainActivity : Activity() {
         if (dialog.isShowing) dialog.dismiss()
     }
 
-    private fun performAppAction(action: AppCommandRouter.Action) {
+    private fun performAppAction(action: AppCommandRouter.Action, force: Boolean = false) {
         Log.d("JarvisDebug", "perform action ${action.name}")
         val now = SystemClock.elapsedRealtime()
-        if (action == AppCommandRouter.Action.OPEN_NOTES && now - lastReminderIntentAt < 8_000L) {
+        if (!force && action == AppCommandRouter.Action.OPEN_NOTES && now - lastReminderIntentAt < 8_000L) {
             Log.d("JarvisDebug", "ignoring open_notes during reminder flow")
             return
         }
@@ -536,29 +653,23 @@ class MainActivity : Activity() {
         lastActionName = action.name
         lastActionAt = now
         when (action) {
-            AppCommandRouter.Action.OPEN_CHAT -> {
-                showChat()
-                toast("Opening chat")
-            }
-            AppCommandRouter.Action.CLOSE_CHAT -> {
-                closeChat()
-                toast("Chat closed")
-            }
+            AppCommandRouter.Action.OPEN_CHAT -> showChat()
+            AppCommandRouter.Action.CLOSE_CHAT -> closeChat()
             AppCommandRouter.Action.CLEAR_CHAT -> clearChat()
             AppCommandRouter.Action.OPEN_SETTINGS -> showSettings()
+            AppCommandRouter.Action.OPEN_PHONE_SETTINGS -> openPhoneSettings()
             AppCommandRouter.Action.OPEN_MEMORY -> openMemory()
             AppCommandRouter.Action.OPEN_NOTES -> openNotes()
             AppCommandRouter.Action.OPEN_MULTIBRAIN -> openMultiBrain()
             AppCommandRouter.Action.CYCLE_ORB -> cycleOrb()
-            AppCommandRouter.Action.MUTE_MIC -> {
-                setMicMuted(true)
-                toast("Microphone muted")
-            }
-            AppCommandRouter.Action.UNMUTE_MIC -> {
-                setMicMuted(false)
-                toast("Microphone on")
-            }
+            AppCommandRouter.Action.MUTE_MIC -> setMicMuted(true)
+            AppCommandRouter.Action.UNMUTE_MIC -> setMicMuted(false)
             AppCommandRouter.Action.BACK -> goBack()
+            AppCommandRouter.Action.HOME -> goHome()
+            AppCommandRouter.Action.BLUETOOTH_ON -> DeviceController.setBluetooth(this, true)
+            AppCommandRouter.Action.BLUETOOTH_OFF -> DeviceController.setBluetooth(this, false)
+            AppCommandRouter.Action.WIFI_ON -> DeviceController.setWifi(this, true)
+            AppCommandRouter.Action.WIFI_OFF -> DeviceController.setWifi(this, false)
         }
     }
 
@@ -596,7 +707,6 @@ class MainActivity : Activity() {
     private fun clearChat() {
         ChatStore.clear()
         JarvisPrefs.clearSessionHandle()
-        toast("Transcript cleared")
     }
 
     private fun cycleOrb() {
@@ -605,21 +715,71 @@ class MainActivity : Activity() {
         val next = (JarvisPrefs.orbStyle + 1) % styles.size
         JarvisPrefs.orbStyle = next
         orb.orbStyle = next
-        toast("Orb style: ${styles[next]}")
     }
 
     private fun goBack() {
         if (chatDialog?.isShowing == true) {
             closeChat()
-            toast("Chat closed")
             return
         }
         val modal = modalDialog
         if (modal != null && modal.isShowing) {
             modal.dismiss()
-            return
         }
-        toast("Nothing to close")
+    }
+
+    private fun goHome() {
+        if (chatDialog?.isShowing == true) closeChat()
+        val modal = modalDialog
+        if (modal != null && modal.isShowing) modal.dismiss()
+        modalDialog = null
+        modalKey = null
+        orb.setLevel(0f)
+        if (active) {
+            orb.mode = OrbView.Mode.LISTENING
+            if (micMuted) {
+                statusLabel.text = "MUTED"
+                statusLabel.setTextColor(Palette.gold)
+                statusDetail.text = MUTE_DETAIL
+            } else {
+                statusLabel.text = "ONLINE"
+                statusLabel.setTextColor(Palette.cyan)
+                statusDetail.text = "Listening — speak naturally"
+            }
+        } else {
+            orb.mode = OrbView.Mode.IDLE
+            statusLabel.text = "STANDBY"
+            statusLabel.setTextColor(Palette.cyan)
+            statusDetail.text =
+                if (JarvisPrefs.hasApiKey()) "Secure voice link ready" else "Add your Gemini API key in Settings"
+        }
+        updateLatest()
+    }
+
+    private fun looksLikeQuestion(text: String): Boolean {
+        if (text.contains("?")) return true
+        val t = text.lowercase()
+        val words = t.replace(Regex("[^\\p{L}\\p{M}\\p{N}\\s]"), " ")
+            .split(' ')
+            .filter { it.isNotEmpty() }
+        if (words.any { it in QUESTION_WORDS }) return true
+        return QUESTION_PHRASES.any { t.contains(it) }
+    }
+
+    private fun parseSilentAction(text: String): AppCommandRouter.Action? {
+        if (text.isBlank()) return null
+        if (looksLikeQuestion(text)) return null
+        return AppCommandRouter.parse(text)
+    }
+
+    private fun beginSilentTurn() {
+        silentActionTurn = true
+        audio?.interrupt()
+    }
+
+    private fun runSilentAction(action: AppCommandRouter.Action, force: Boolean = false) {
+        beginSilentTurn()
+        performAppAction(action, force)
     }
 
     private fun detectSpokenAction(text: String) {
@@ -684,17 +844,25 @@ class MainActivity : Activity() {
     }
 
     private fun handleAppCommand(raw: String, allowNoteCreate: Boolean = true): Boolean {
+        val command = SpeechCorrectionResolver.latestInstruction(raw)
+        if (allowNoteCreate && !command.equals(raw.trim(), ignoreCase = true)) {
+            val latestAction = parseSilentAction(command)
+            if (latestAction != null) {
+                runSilentAction(latestAction, force = true)
+                return true
+            }
+        }
         if (allowNoteCreate && handleReminderQuery(raw)) return true
         if (allowNoteCreate && handleVoiceReminder(raw)) return true
-        if (allowNoteCreate && handleNoteCreation(raw)) return true
-        if (VoiceReminderParser.hasTrigger(raw) && !isExplicitNotesOpen(raw)) {
+        if (allowNoteCreate && handleNoteCreation(command)) return true
+        if (VoiceReminderParser.hasTrigger(command) && !isExplicitNotesOpen(command)) {
             if (allowNoteCreate) askForReminderTime()
             return true
         }
-        val action = AppCommandRouter.parse(raw)
-        Log.d("JarvisDebug", "parse '$raw' -> ${action?.name ?: "none"}")
+        val action = parseSilentAction(command)
+        Log.d("JarvisDebug", "parse '$command' -> ${action?.name ?: "none"}")
         if (action == null) return false
-        performAppAction(action)
+        runSilentAction(action)
         return true
     }
 
@@ -706,28 +874,164 @@ class MainActivity : Activity() {
     private fun scheduleVoiceReminder(text: String) {
         if (!VoiceReminderParser.hasTrigger(text)) return
         lastReminderIntentAt = SystemClock.elapsedRealtime()
-        if (VoiceReminderParser.parse(text) != null) acknowledgeReminderCommand()
         pendingReminderText = text
         reminderHandler.removeCallbacks(parsePendingReminder)
         reminderHandler.postDelayed(parsePendingReminder, 1200L)
     }
 
     private fun acknowledgeReminderCommand() {
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastReminderAckAt < 10_000L) return
+        if (reminderAckAwaiting || reminderAckDone) return
         val live = client ?: return
         if (!active) return
-        lastReminderAckAt = now
-        live.sendText(
-            "[SYSTEM] The app is setting the reminder automatically in the background. " +
-                "Say exactly one short sentence: \"Ok, reminder set ho raha hai.\" " +
-                "Do not say you opened any page. Do not ask the user to set it."
+        reminderAckAwaiting = true
+        reminderAckAudioSeen = false
+        reminderAckHeard = false
+        reminderAckStartedAt = SystemClock.elapsedRealtime()
+        lastReminderAckAt = reminderAckStartedAt
+        val sent = live.sendText(
+            "[SYSTEM] The app is creating the reminder in the background. " +
+                "Say exactly one short sentence and nothing else: " +
+                "\"Okay, reminder set ho raha hai.\" " +
+                "Do not mention the task, time, date, AM/PM or any page. " +
+                "Do not ask the user anything."
         )
+        if (!sent) {
+            reminderAckAwaiting = false
+            reminderAckDone = true
+            reminderAckDoneAt = SystemClock.elapsedRealtime()
+            maybeScheduleReminderFinal()
+            return
+        }
+        reminderHandler.removeCallbacks(reminderAckTimeout)
+        reminderHandler.postDelayed(reminderAckTimeout, 7_000L)
+    }
+
+    private fun finishReminderAck() {
+        if (reminderAckDone) return
+        reminderAckAwaiting = false
+        reminderAckDone = true
+        reminderAckDoneAt = SystemClock.elapsedRealtime()
+        reminderHandler.removeCallbacks(reminderAckTimeout)
+        maybeScheduleReminderFinal()
+        maybeSpeakReminderFailure()
+    }
+
+    private fun beginReminderFlow() {
+        resetReminderConfirmation()
+        reminderFlowToken += 1
+    }
+
+    private fun resetReminderConfirmation() {
+        reminderHandler.removeCallbacks(reminderFinalRunnable)
+        reminderHandler.removeCallbacks(reminderPlaybackCheck)
+        reminderHandler.removeCallbacks(reminderAckTimeout)
+        reminderHandler.removeCallbacks(reminderFailureCheck)
+        reminderAckAwaiting = false
+        reminderAckDone = false
+        reminderAckAudioSeen = false
+        reminderAckHeard = false
+        reminderAckStartedAt = 0L
+        reminderAckDoneAt = 0L
+        reminderAckPlaybackIdleAt = 0L
+        reminderSuccessAt = 0L
+        reminderSuccessNoteId = 0L
+        reminderFinalPending = false
+        reminderFinalScheduled = false
+        reminderFinalSent = false
+        reminderFailurePending = false
+        reminderFailureSent = false
+    }
+
+    private fun isPlaybackIdle(): Boolean = audio?.isPlaybackIdle() ?: true
+
+    private fun maybeScheduleReminderFinal() {
+        if (!reminderFinalPending || reminderFinalSent || !reminderAckDone) return
+        if (!isPlaybackIdle()) {
+            reminderHandler.removeCallbacks(reminderPlaybackCheck)
+            reminderHandler.postDelayed(reminderPlaybackCheck, 150L)
+            return
+        }
+        if (reminderFinalScheduled) return
+        val now = SystemClock.elapsedRealtime()
+        if (reminderAckPlaybackIdleAt == 0L) reminderAckPlaybackIdleAt = now
+        val readyAt = maxOf(reminderSuccessAt, reminderAckPlaybackIdleAt) + reminderFinalPauseMs
+        val delay = (readyAt - now).coerceAtLeast(0L)
+        reminderFinalScheduled = true
+        reminderHandler.removeCallbacks(reminderFinalRunnable)
+        reminderHandler.postDelayed(reminderFinalRunnable, delay)
+    }
+
+    private fun sendReminderSuccessConfirmation() {
+        reminderFinalScheduled = false
+        if (!reminderFinalPending || reminderFinalSent) return
+        if (!reminderAckDone || !isPlaybackIdle()) {
+            maybeScheduleReminderFinal()
+            return
+        }
+        reminderFinalPending = false
+        reminderFinalSent = true
+        val note = NoteStore.get(reminderSuccessNoteId)
+        val details = note?.let { noteDetails(it) }.orEmpty().replace('"', '\'')
+        val confirmation = if (details.isBlank() || details.equals("Reminder", ignoreCase = true)) {
+            "Reminder set ho gaya."
+        } else {
+            "Reminder set ho gaya, $details."
+        }
+        val live = client
+        if (live != null && active) {
+            val sent = live.sendText(
+                "[SYSTEM] The reminder was created successfully. " +
+                    "Say exactly one short sentence and nothing else: \"$confirmation\" " +
+                    "Do not mention the time, date, AM/PM or any clock value. " +
+                    "Do not say you opened any page."
+            )
+            if (!sent) toast(confirmation)
+        } else {
+            toast(confirmation)
+        }
+    }
+
+    private fun onReminderCreated(noteId: Long) {
+        reminderSuccessNoteId = noteId
+        reminderSuccessAt = SystemClock.elapsedRealtime()
+        if (reminderFinalSent) return
+        reminderFinalPending = true
+        reminderFinalScheduled = false
+        maybeScheduleReminderFinal()
+    }
+
+    private fun onReminderCreationFailed() {
+        reminderFinalPending = false
+        reminderFinalScheduled = false
+        reminderHandler.removeCallbacks(reminderFinalRunnable)
+        reminderFailurePending = true
+        maybeSpeakReminderFailure()
+    }
+
+    private fun maybeSpeakReminderFailure() {
+        if (!reminderFailurePending || reminderFailureSent || !reminderAckDone) return
+        if (!isPlaybackIdle()) {
+            reminderHandler.removeCallbacks(reminderFailureCheck)
+            reminderHandler.postDelayed(reminderFailureCheck, 150L)
+            return
+        }
+        reminderFailurePending = false
+        reminderFailureSent = true
+        val message = "Reminder set nahi ho paya."
+        val live = client
+        if (live != null && active) {
+            val sent = live.sendText(
+                "[SYSTEM] The reminder could not be created. " +
+                    "Say exactly one short sentence and nothing else: \"$message\""
+            )
+            if (!sent) toast(message)
+        } else {
+            toast(message)
+        }
     }
 
     private fun handleVoiceReminder(raw: String): Boolean {
         val parsed = VoiceReminderParser.parse(raw) ?: return false
-        acknowledgeReminderCommand()
         val now = SystemClock.elapsedRealtime()
         lastReminderIntentAt = now
         val previousRaw = lastReminderRawText
@@ -736,8 +1040,12 @@ class MainActivity : Activity() {
                 previousRaw.contains(raw, ignoreCase = true))
         val sameSlot = related || (parsed.atMillis == lastReminderScheduledAt &&
             now - lastReminderAt < 8000L)
+        val continueFlow = sameSlot && reminderFlowToken != 0 && !reminderFinalSent
+        if (!continueFlow) {
+            beginReminderFlow()
+            acknowledgeReminderCommand()
+        }
         var id = if (sameSlot) lastReminderNoteId else 0L
-        var changed = false
         if (id > 0L) {
             val existing = NoteStore.get(id)
             if (existing == null) {
@@ -750,26 +1058,31 @@ class MainActivity : Activity() {
                 if (detailsChanged || timeChanged) {
                     val title = if (newDetails.isNotBlank()) parsed.title else existing.title
                     val body = if (newDetails.isNotBlank()) parsed.body else existing.body
-                    NoteStore.update(id, title, body, parsed.atMillis)
-                    changed = true
+                    if (!NoteStore.update(id, title, body, parsed.atMillis)) id = 0L
                 }
             }
         }
         if (id <= 0L) {
             id = NoteStore.add(parsed.title, parsed.body, parsed.atMillis)
-            if (id <= 0L) return false
+            if (id <= 0L) {
+                lastReminderRawText = raw
+                lastReminderScheduledAt = parsed.atMillis
+                lastReminderAt = now
+                onReminderCreationFailed()
+                return true
+            }
             lastReminderNoteId = id
-            changed = true
         }
         lastReminderRawText = raw
         lastReminderScheduledAt = parsed.atMillis
         lastReminderAt = now
-        NoteStore.get(id)?.let { ReminderScheduler.schedule(applicationContext, it) }
-        if (changed) {
-            pendingConfirmNoteId = id
-            reminderHandler.removeCallbacks(confirmReminderRunnable)
-            reminderHandler.postDelayed(confirmReminderRunnable, 1200L)
+        val note = NoteStore.get(id)
+        if (note == null) {
+            onReminderCreationFailed()
+            return true
         }
+        ReminderScheduler.schedule(applicationContext, note)
+        onReminderCreated(id)
         return true
     }
 
@@ -788,29 +1101,6 @@ class MainActivity : Activity() {
             title.isNotBlank() && !title.equals("Reminder", ignoreCase = true) -> title
             note.body.trim().isNotBlank() -> note.body.trim()
             else -> ""
-        }
-    }
-
-    private fun sendReminderConfirmation(noteId: Long) {
-        val note = NoteStore.get(noteId) ?: return
-        val formatted = SimpleDateFormat("dd MMM, h:mm a", Locale.getDefault())
-            .format(Date(note.remindAt))
-        val details = noteDetails(note).replace('"', '\'')
-        val confirmation = if (details.isBlank()) {
-            "Ho gaya, reminder set hai — $formatted."
-        } else {
-            "Ho gaya, reminder set hai — $details, $formatted."
-        }
-        val live = client
-        if (live != null && active) {
-            live.sendText(
-                "[SYSTEM] The reminder is now successfully set for $formatted. " +
-                    "Say exactly one short sentence in the user's language: " +
-                    "\"$confirmation\" " +
-                    "Do not say you opened any page. Do not ask the user to set it."
-            )
-        } else {
-            toast("Reminder set for $formatted")
         }
     }
 
@@ -987,6 +1277,13 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun openPhoneSettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun showSettings() {
         showModal("settings") {
             SettingsDialog(this, {
@@ -995,6 +1292,7 @@ class MainActivity : Activity() {
                     statusDetail.text =
                         if (JarvisPrefs.hasApiKey()) "Configuration updated — ready when you are"
                         else "Add your Gemini API key in Settings"
+                    autoConnectIfIdle()
                 }
                 toast("Configuration saved")
             }, {
@@ -1073,10 +1371,12 @@ class MainActivity : Activity() {
 
         override fun onSetupComplete() {
             if (stopRequested) return
-            val engine = audio
-            if (engine == null || !engine.startCapture()) {
-                endWithError("MICROPHONE ERROR", "Could not open the microphone")
-                return
+            if (!micMuted) {
+                val engine = audio
+                if (engine == null || !engine.startCapture()) {
+                    endWithError("MICROPHONE ERROR", "Could not open the microphone")
+                    return
+                }
             }
             connecting = false
             active = true
@@ -1097,10 +1397,20 @@ class MainActivity : Activity() {
                 latest.text = "Say “Jarvis, are you there?”"
                 latest.setTextColor(Palette.ice)
             }
+            if (micMuted) {
+                statusLabel.text = "MUTED"
+                statusLabel.setTextColor(Palette.gold)
+                statusDetail.text = MUTE_DETAIL
+                orb.setLevel(0f)
+                JarvisSessionService.setMuted(this@MainActivity, true)
+                startUnmuteDetector()
+            }
         }
 
         override fun onAudio(data: ByteArray) {
             if (!active) return
+            if (silentActionTurn) return
+            if (reminderAckAwaiting && !reminderAckDone) reminderAckAudioSeen = true
             audio?.play(data)
             orb.mode = OrbView.Mode.SPEAKING
             statusLabel.text = "SPEAKING"
@@ -1118,7 +1428,10 @@ class MainActivity : Activity() {
                 val last = ChatStore.snapshot().lastOrNull {
                     it.role == ChatStore.Role.USER && it.final && it.text.isNotBlank()
                 }
-                if (last != null) handleAppCommand(last.text)
+                if (last != null) {
+                    if (parseSilentAction(last.text) == null) silentActionTurn = false
+                    handleAppCommand(last.text)
+                }
             } else if (text.isNotBlank()) {
                 currentUserText()?.let { scheduleVoiceReminder(it) }
             }
@@ -1148,8 +1461,17 @@ class MainActivity : Activity() {
         }
 
         override fun onOutputTranscript(text: String) {
+            if (silentActionTurn) return
             ChatStore.appendModel(text)
             assistantTurnText.append(text)
+            if (reminderAckAwaiting && !reminderAckDone) {
+                val turn = assistantTurnText.toString().lowercase()
+                if (turn.contains("reminder set ho raha") ||
+                    turn.contains("reminder set ho rahi")
+                ) {
+                    reminderAckHeard = true
+                }
+            }
             detectSpokenAction(assistantTurnText.toString())
             if (active) {
                 orb.mode = OrbView.Mode.SPEAKING
@@ -1161,6 +1483,13 @@ class MainActivity : Activity() {
         }
 
         override fun onTurnComplete() {
+            silentActionTurn = false
+            if (reminderAckAwaiting && !reminderAckDone) {
+                val elapsed = SystemClock.elapsedRealtime() - reminderAckStartedAt
+                if (reminderAckHeard || (reminderAckAudioSeen && elapsed > 1200L)) {
+                    finishReminderAck()
+                }
+            }
             ChatStore.assistantDone()
             rememberCompletedSpeech()
             assistantTurnText.setLength(0)
@@ -1170,7 +1499,7 @@ class MainActivity : Activity() {
                     orb.mode = OrbView.Mode.LISTENING
                     statusLabel.text = "MUTED"
                     statusLabel.setTextColor(Palette.gold)
-                    statusDetail.text = "Microphone off — tap the mic to speak"
+                    statusDetail.text = MUTE_DETAIL
                 } else {
                     orb.mode = OrbView.Mode.LISTENING
                     statusLabel.text = "ONLINE"
@@ -1183,6 +1512,7 @@ class MainActivity : Activity() {
 
         override fun onInterrupted() {
             audio?.interrupt()
+            if (reminderAckAwaiting && !reminderAckDone) finishReminderAck()
             ChatStore.interrupted()
             assistantTurnText.setLength(0)
             if (active) {
@@ -1213,6 +1543,16 @@ class MainActivity : Activity() {
             if (handle.isNotBlank()) JarvisPrefs.sessionHandle = handle
         }
 
+        override fun onDeviceAction(name: String, args: JSONObject, id: String) {
+            beginSilentTurn()
+            val result = try {
+                DeviceController.handle(this@MainActivity, name, args)
+            } catch (t: Throwable) {
+                "Action failed: ${t.message ?: "unknown error"}"
+            }
+            client?.respondToDevice(id, name, result)
+        }
+
         override fun onAppCommand(name: String) {
             Log.d("JarvisDebug", "tool call $name")
             val action = when (name) {
@@ -1229,7 +1569,7 @@ class MainActivity : Activity() {
                 "go_back" -> AppCommandRouter.Action.BACK
                 else -> return
             }
-            performAppAction(action)
+            runSilentAction(action)
         }
 
         override fun onClosed(reason: String) {
@@ -1265,6 +1605,7 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQUEST_PERMISSIONS = 701
+        private const val MUTE_DETAIL = "Microphone off — say \"Hey Jarvis\" to unmute"
         private const val APP_CONTROL_INSTRUCTION =
             "You control this app through the provided functions. You MUST call the matching " +
                 "function when the user asks to: open chat (open_chat), close chat or say back/" +
@@ -1278,9 +1619,38 @@ class MainActivity : Activity() {
                 "cannot control the app. REMINDERS: the app creates reminders silently in the " +
                 "background. Never open the notepad or any page to create a reminder. Never tell " +
                 "the user to set a reminder themselves and never say you opened a page. When the " +
-                "user asks to set a reminder, say only 'Ok, reminder set ho raha hai.' and wait; " +
-                "the app will send a [SYSTEM] confirmation. When you receive a [SYSTEM] reminder " +
-                "confirmation or a reminder list, repeat it exactly. When the user asks what " +
-                "reminders are set, read the provided list."
+                "user asks to set a reminder, stay silent and wait. The app will send a [SYSTEM] " +
+                "acknowledgement instruction; say only 'Okay, reminder set ho raha hai.' Then " +
+                "wait for the app's [SYSTEM] success confirmation and repeat it exactly. Never " +
+                "include the reminder time, date, AM/PM or any clock value in the success " +
+                "confirmation. When you receive a [SYSTEM] reminder list, repeat it exactly. " +
+                "When the user asks what reminders are set, read the provided list. Keep reminder " +
+                "titles SHORT and task-only. Never put time words in the title: am, pm, p m, a m, " +
+                "baje, o'clock, tomorrow, kal, today, aaj, dates, or clock times. The app parses " +
+                "time separately."
+
+        private const val DEVICE_CONTROL_INSTRUCTION =
+            "DEVICE CONTROL: You can also operate the phone through device functions. Call " +
+                "open_app when the user asks to open or launch any installed app (for example " +
+                "'WhatsApp kholo' or 'open YouTube'). Call open_url to open a website or run a web " +
+                "search in the browser. After a device function, keep your reply to at most one " +
+                "short sentence. Never claim an action succeeded if the tool result reports failure."
+
+        private const val SILENT_COMMAND_INSTRUCTION =
+            "SILENT COMMANDS: For app and phone control commands (open or close screens, settings, " +
+                "memory, notes, chat, microphone, orb, back, home, Bluetooth, WiFi, open app, open " +
+                "URL), perform the action and remain COMPLETELY SILENT. Do not speak, do not output " +
+                "any text, and do not confirm, announce or describe the action. Only call the " +
+                "matching function if one exists; otherwise do nothing. If the user is asking a " +
+                "question, making conversation, or the intent is not a clear control command, do " +
+                "NOT call any control function and answer normally with your voice. Never repeat " +
+                "or summarise a control action."
+
+        private val QUESTION_WORDS = setOf(
+            "kya", "kaise", "kaun", "kab", "kahan", "kaha", "kyu", "kyun", "kitna",
+            "kitni", "kitne", "batao", "bataiye", "explain", "samjhao", "what", "why",
+            "how", "when", "where", "who", "which", "weather", "mausam"
+        )
+        private val QUESTION_PHRASES = listOf("bata do", "kya hai", "kaise hai", "kya hua")
     }
 }

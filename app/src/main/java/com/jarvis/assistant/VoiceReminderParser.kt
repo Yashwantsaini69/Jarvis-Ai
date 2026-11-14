@@ -1,36 +1,61 @@
 package com.jarvis.assistant
 
+import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 
 object VoiceReminderParser {
 
     data class Parsed(
         val title: String,
         val body: String,
-        val atMillis: Long
-    )
+        val atMillis: Long,
+        val cancelledInstructions: List<String> = emptyList(),
+        val needsClarification: Boolean = false,
+        val clarificationQuestion: String = "",
+        val corrected: Boolean = false
+    ) {
+        fun toJson(): String {
+            fun esc(value: String): String = value
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+            val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(atMillis))
+            val time = SimpleDateFormat("HH:mm", Locale.US).format(Date(atMillis))
+            val cancelled = cancelledInstructions.joinToString(",") { "\"${esc(it)}\"" }
+            return "{\"intent\":\"set_reminder\"," +
+                "\"title\":\"${esc(title)}\"," +
+                "\"date\":\"$date\"," +
+                "\"time\":\"$time\"," +
+                "\"cancelled_instructions\":[$cancelled]," +
+                "\"needs_clarification\":$needsClarification}"
+        }
+    }
 
-    private val triggerWords = setOf(
+    internal val triggerWords = setOf(
         "reminder", "reminders", "remind", "alarm", "alert",
         "wake", "wakeup", "uthana", "uthna", "jagana", "jagna", "jaga",
         "रिमाइंडर", "अलार्म", "एलर्ट", "उठाना", "उठना", "जगाना"
     )
 
-    private val clockWords = setOf("baje", "baj", "oclock", "o'clock", "बजे")
+    internal val clockWords = setOf("baje", "baj", "oclock", "o'clock", "बजे")
 
-    private val meridianWords = setOf("am", "pm")
+    internal val meridianWords = setOf("am", "pm")
+    internal val meridianParts = setOf("a", "p", "m")
 
-    private val afterWords = setOf(
+    internal val afterWords = setOf(
         "baad", "bad", "after", "in", "me", "बाद", "में", "मे"
     )
 
-    private val dateTomorrowWords = setOf(
+    internal val dateTomorrowWords = setOf(
         "kal", "tomorrow", "tommorow", "tomorow", "tmrw", "2moro", "कल"
     )
-    private val dateTodayWords = setOf("aaj", "today", "आज")
-    private val dateParsoWords = setOf("parso", "parson", "परसों")
+    internal val dateTodayWords = setOf("aaj", "today", "आज")
+    internal val dateParsoWords = setOf("parso", "parson", "परसों")
 
-    private val monthWords: Map<String, Int> = mapOf(
+    internal val monthWords: Map<String, Int> = mapOf(
         "jan" to Calendar.JANUARY, "january" to Calendar.JANUARY,
         "feb" to Calendar.FEBRUARY, "february" to Calendar.FEBRUARY,
         "mar" to Calendar.MARCH, "march" to Calendar.MARCH,
@@ -52,36 +77,54 @@ object VoiceReminderParser {
         "दिसंबर" to Calendar.DECEMBER
     )
 
-    private val morningWords = setOf("subah", "morning", "सुबह")
-    private val afternoonWords = setOf("dopahar", "afternoon", "दोपहर")
-    private val eveningWords = setOf("shaam", "sham", "evening", "शाम")
-    private val nightWords = setOf("raat", "rat", "night", "रात")
+    internal val morningWords = setOf("subah", "morning", "सुबह")
+    internal val afternoonWords = setOf("dopahar", "afternoon", "दोपहर")
+    internal val eveningWords = setOf("shaam", "sham", "evening", "शाम")
+    internal val nightWords = setOf("raat", "rat", "night", "रात")
 
-    private val unitSeconds: Map<String, Long> = mapOf(
+    internal val unitSeconds: Map<String, Long> = mapOf(
         "second" to 1L, "seconds" to 1L, "sec" to 1L, "secs" to 1L, "सेकंड" to 1L,
         "minute" to 60L, "minutes" to 60L, "min" to 60L, "mins" to 60L, "मिनट" to 60L,
         "hour" to 3600L, "hours" to 3600L, "ghanta" to 3600L, "ghante" to 3600L,
         "घंटा" to 3600L, "घंटे" to 3600L
     )
 
-    private val fillerWords = setOf(
+    internal val fillerWords = setOf(
         "please", "pls", "plz", "me", "to", "at", "on", "for", "set", "lagao",
         "lagana", "lagado", "laga", "lag", "kar", "karo", "kardo", "do", "de",
         "dijiye", "mujhe", "muje", "mereko", "merko", "meko", "mera", "meri",
         "ka", "ke", "ki", "liye", "liy", "of",
         "pe", "par", "ko", "se", "tak", "time", "dena", "deni", "dunga", "dungi",
         "denge", "dilana", "yaad", "dila", "dilao", "dilado", "in", "up",
-        "hai", "है",
         "remind", "मुझे", "मेरा", "मेरी", "का", "के", "की", "लिए", "याद", "दिला",
         "दिलाओ", "लगाओ", "करो", "कर", "दो", "सेट", "पे", "पर", "को", "से", "तक",
         "समय", "देना", "दूंगा", "दूंगी"
     )
 
-    fun hasTrigger(raw: String): Boolean = isReminderRequest(tokenize(raw))
+    fun hasTrigger(raw: String): Boolean {
+        if (isReminderRequest(tokenize(raw))) return true
+        val resolution = SpeechCorrectionResolver.resolve(raw)
+        return resolution.hasCorrection && resolution.time != null && resolution.title != null
+    }
 
     fun parse(raw: String, now: Long = System.currentTimeMillis()): Parsed? {
+        if (!hasTrigger(raw)) return null
+        val resolution = SpeechCorrectionResolver.resolve(raw, now)
+        val parsed = if (resolution.hasCorrection) {
+            resolution.canonicalReminder(now)?.let { parseLegacy(it, now) }
+        } else {
+            parseLegacy(raw, now)
+        } ?: return null
+        return parsed.copy(
+            cancelledInstructions = resolution.cancelled,
+            needsClarification = resolution.needsClarification,
+            clarificationQuestion = resolution.clarificationQuestion,
+            corrected = resolution.hasCorrection
+        )
+    }
+
+    private fun parseLegacy(raw: String, now: Long): Parsed? {
         val tokens = tokenize(raw)
-        if (!isReminderRequest(tokens)) return null
 
         val used = mutableSetOf<Int>()
         markTrigger(tokens, used)
@@ -95,6 +138,7 @@ object VoiceReminderParser {
                 token !in triggerWords &&
                 token !in clockWords &&
                 token !in meridianWords &&
+                token !in meridianParts &&
                 token !in afterWords &&
                 token !in dateTomorrowWords &&
                 token !in dateTodayWords &&
@@ -107,20 +151,24 @@ object VoiceReminderParser {
                 token !in monthWords.keys &&
                 token !in unitSeconds.keys
         }
-        val title = content.joinToString(" ").trim().ifEmpty { "Reminder" }
+        val rawTitle = content.joinToString(" ").trim()
+        val title = if (rawTitle.lowercase() in genericTitles) "Reminder" else rawTitle.ifEmpty { "Reminder" }
         val pretty = title.replaceFirstChar {
             if (it.isLowerCase()) it.titlecase() else it.toString()
         }
         return Parsed(pretty, pretty, at)
     }
 
-    private fun tokenize(raw: String): List<String> {
+    private val genericTitles = setOf("hai", "h", "he", "hain", "है", "हैं")
+
+    internal fun tokenize(raw: String): List<String> {
         return raw.lowercase()
             .replace(Regex("(\\d+)(st|nd|rd|th)\\b"), "$1")
             .replace(Regex("(\\d):(\\d{2})(am|pm)\\b"), "$1:$2 $3")
             .replace(Regex("(\\d)(am|pm)\\b"), "$1 $2")
             .replace(Regex("(\\d)[.](\\d{2})\\b"), "$1:$2")
             .replace(Regex("[^\\p{L}\\p{M}\\p{N}:/]+"), " ")
+            .replace(Regex("\\b([ap])\\s+(m)\\b"), "$1m")
             .replace(Regex("\\s+"), " ")
             .trim()
             .split(' ')
@@ -203,6 +251,10 @@ object VoiceReminderParser {
                     used.add(i + 1)
                 } else if (i + 1 < tokens.size && tokens[i + 1] in clockWords) {
                     used.add(i + 1)
+                    if (i + 2 < tokens.size && tokens[i + 2] in meridianWords) {
+                        meridian = tokens[i + 2]
+                        used.add(i + 2)
+                    }
                 }
                 break
             }
@@ -215,6 +267,10 @@ object VoiceReminderParser {
                     hour = h
                     minute = m
                     used.addAll(listOf(i, i + 1, i + 2))
+                    if (i + 3 < tokens.size && tokens[i + 3] in meridianWords) {
+                        meridian = tokens[i + 3]
+                        used.add(i + 3)
+                    }
                     break
                 }
                 if (m != null && m in 0..59 && tokens[i + 2] in meridianWords) {
@@ -229,6 +285,10 @@ object VoiceReminderParser {
                 hour = h
                 minute = 0
                 used.addAll(listOf(i, i + 1))
+                if (i + 2 < tokens.size && tokens[i + 2] in meridianWords) {
+                    meridian = tokens[i + 2]
+                    used.add(i + 2)
+                }
                 break
             }
             if (i + 1 < tokens.size && tokens[i + 1] in meridianWords) {
@@ -288,7 +348,7 @@ object VoiceReminderParser {
         return at
     }
 
-    private fun parseExplicitDate(tokens: List<String>, used: MutableSet<Int>): Pair<Int, Int>? {
+    internal fun parseExplicitDate(tokens: List<String>, used: MutableSet<Int>): Pair<Int, Int>? {
         for (i in tokens.indices) {
             val numeric = tokens[i].split('/')
             if (numeric.size == 2) {

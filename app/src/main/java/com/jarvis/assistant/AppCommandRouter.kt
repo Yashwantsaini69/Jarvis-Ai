@@ -6,13 +6,19 @@ object AppCommandRouter {
         CLOSE_CHAT,
         CLEAR_CHAT,
         OPEN_SETTINGS,
+        OPEN_PHONE_SETTINGS,
         OPEN_MEMORY,
         OPEN_NOTES,
         OPEN_MULTIBRAIN,
         CYCLE_ORB,
         MUTE_MIC,
         UNMUTE_MIC,
-        BACK
+        BACK,
+        HOME,
+        BLUETOOTH_ON,
+        BLUETOOTH_OFF,
+        WIFI_ON,
+        WIFI_OFF
     }
 
     private val openWords = setOf(
@@ -42,15 +48,22 @@ object AppCommandRouter {
         "सेटिंग", "सेटिंग्स"
     )
     private val memoryWords = setOf("memory", "memories", "yaad", "yaadein", "मेमोरी", "याद")
+    private val phoneWords = setOf(
+        "phone", "system", "android", "device", "mobile", "फोन", "सिस्टम", "एंड्रॉइड"
+    )
     private val noteWords = setOf(
         "note", "notes", "notepad", "reminder", "reminders",
         "नोट", "नोट्स", "नोटपैड", "रिमाइंडर"
     )
     private val orbWords = setOf("orb", "theme", "style", "look", "ऑर्ब", "थीम")
+    private val bluetoothWords = setOf("bluetooth", "bt", "ब्लूटूथ")
+    private val wifiWords = setOf("wifi", "wi-fi", "वाईफाई", "वाई-फाई")
+    private val switchOnWords = setOf("on", "enable", "chalu", "start", "ऑन", "चालू", "शुरू")
+    private val switchOffWords = setOf("off", "disable", "band", "stop", "बंद")
 
     fun parse(raw: String): Action? {
         val cleaned = raw.lowercase()
-            .replace(Regex("[^\\p{L}\\p{M}\\p{N}\\s]"), " ")
+            .replace(Regex("[^\\p{L}\\p{M}\\p{N}\\s-]"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
         if (cleaned.isEmpty()) return null
@@ -67,12 +80,30 @@ object AppCommandRouter {
         val isMemory = any(memoryWords)
         val isNotes = any(noteWords)
         val isOrb = any(orbWords)
+        val isBluetooth = any(bluetoothWords) || cleaned.contains("blue tooth")
+        val isWifi = any(wifiWords) || cleaned.contains("wi fi")
+        val isHome = words.contains("home") || words.contains("homescreen") ||
+            cleaned.contains("home screen") || words.contains("ghar") ||
+            words.contains("घर") || words.contains("होम")
         val isMultiBrain = cleaned.contains("multi brain") ||
             words.contains("multibrain") ||
             (words.contains("brain") && (words.contains("manager") || words.contains("managers")))
 
         if (words.contains("unmute")) return Action.UNMUTE_MIC
         if (words.contains("mute") || words.contains("muted")) return Action.MUTE_MIC
+
+        if (isHome) return Action.HOME
+
+        if (isBluetooth) {
+            if (any(switchOffWords)) return Action.BLUETOOTH_OFF
+            if (any(switchOnWords)) return Action.BLUETOOTH_ON
+            return null
+        }
+        if (isWifi) {
+            if (any(switchOffWords)) return Action.WIFI_OFF
+            if (any(switchOnWords)) return Action.WIFI_ON
+            return null
+        }
 
         if (isOrb && wantsChange) return Action.CYCLE_ORB
 
@@ -93,8 +124,10 @@ object AppCommandRouter {
             return null
         }
         if (isSettings) {
-            if (wantsOpen && !wantsClose) return Action.OPEN_SETTINGS
             if (wantsClose) return Action.BACK
+            if (wantsOpen) {
+                return if (any(phoneWords)) Action.OPEN_PHONE_SETTINGS else Action.OPEN_SETTINGS
+            }
             return null
         }
         if (isMemory) {
