@@ -7,18 +7,20 @@ import android.database.sqlite.SQLiteOpenHelper
 import java.util.UUID
 
 private const val DB_NAME = "jarvis_memory.db"
-private const val DB_VERSION = 2
+private const val DB_VERSION = 4
 private const val TABLE_MEMORIES = "memories"
 private const val TABLE_META = "meta"
 private const val MAX_ROWS = 300
 private const val META_SIGNATURE = "last_processed_signature"
+private const val META_DOCUMENT = "memory_document"
+private const val MAX_DOC_CHARS = 8000
 private const val SOURCE_VOICE = "voice"
 private const val SOURCE_MANUAL = "manual"
 
 private const val RANK_ORDER = "importance DESC, updated_at DESC"
 
 private val ALLOWED_TYPES = setOf(
-    "identity", "location", "work", "education", "preference", "project", "note"
+    "identity", "location", "work", "education", "preference", "project", "goal", "note"
 )
 
 private val STOPWORDS = setOf(
@@ -73,9 +75,7 @@ private val TARGET_KEYWORDS: Map<String, Pair<String, String?>> = mapOf(
 
 object MemoryStore {
 
-    val categories = listOf(
-        "Personal", "Preferences", "Work", "Study", "Important Notes", "Other"
-    )
+    val categories = listOf("Personal", "Important", "Others")
 
     data class MemoryItem(
         val id: Long,
@@ -101,10 +101,73 @@ object MemoryStore {
         }
     }
 
+    fun allowedType(type: String): Boolean = type in ALLOWED_TYPES
+
+    fun document(): String {
+        val db = writable() ?: return ""
+        return synchronized(lock) {
+            try {
+                readMeta(db, META_DOCUMENT) ?: buildDocumentFromRows(db).also {
+                    writeMeta(db, META_DOCUMENT, it)
+                }
+            } catch (_: Exception) {
+                ""
+            }
+        }
+    }
+
+    fun saveDocument(text: String): Boolean {
+        val db = writable() ?: return false
+        return synchronized(lock) {
+            try {
+                writeMeta(db, META_DOCUMENT, cleanDocument(text))
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
+    fun clearDocument(): Int {
+        val db = writable() ?: return 0
+        return synchronized(lock) {
+            try {
+                val before = readMeta(db, META_DOCUMENT) ?: buildDocumentFromRows(db)
+                writeMeta(db, META_DOCUMENT, "")
+                before.length
+            } catch (_: Exception) {
+                0
+            }
+        }
+    }
+
+    fun saveEntries(entries: List<MemoryExtractor.MemoryEntry>): Int {
+        if (entries.isEmpty()) return 0
+        val db = writable() ?: return 0
+        return synchronized(lock) {
+            try {
+                var doc = currentDocument(db)
+                var added = 0
+                for (entry in entries) {
+                    val merged = mergeLine(doc, documentLine(entry.type, entry.key, entry.value))
+                    if (merged != doc) {
+                        doc = merged
+                        added++
+                    }
+                }
+                if (added > 0) writeMeta(db, META_DOCUMENT, doc.take(MAX_DOC_CHARS))
+                added
+            } catch (_: Exception) {
+                0
+            }
+        }
+    }
+
     fun observeUserMessage(messageId: Long, text: String, final: Boolean): Int {
         if (!final) return 0
         val clean = text.trim()
         if (clean.length < 3) return 0
+        MemoryBrain.observe(messageId, clean)
         val commands = try {
             MemoryExtractor.extract(clean)
         } catch (_: Exception) {
@@ -117,91 +180,59 @@ object MemoryStore {
             if (readMeta(db, META_SIGNATURE) == signature) {
                 0
             } else {
-                var applied = 0
                 try {
-                    db.beginTransaction()
-                    for (command in commands) applied += applyCommand(db, command)
-                    writeMeta(db, META_SIGNATURE, signature)
-                    prune(db)
-                    db.setTransactionSuccessful()
-                } catch (_: Exception) {
-                    applied = 0
-                } finally {
-                    try {
-                        db.endTransaction()
-                    } catch (_: Exception) {
+                    var doc = currentDocument(db)
+                    var applied = 0
+                    for (command in commands) {
+                        when (command) {
+                            is MemoryExtractor.Command.Save -> {
+                                val line = documentLine(
+                                    command.entry.type,
+                                    command.entry.key,
+                                    command.entry.value
+                                )
+                                val merged = mergeLine(doc, line)
+                                if (merged != doc) {
+                                    doc = merged
+                                    applied++
+                                }
+                            }
+                            is MemoryExtractor.Command.Forget -> {
+                                val result = forgetFromDocument(doc, command.query)
+                                if (result.first != doc) {
+                                    doc = result.first
+                                    applied += result.second
+                                }
+                            }
+                            MemoryExtractor.Command.Clear -> {
+                                if (doc.isNotEmpty()) {
+                                    doc = ""
+                                    applied++
+                                }
+                            }
+                        }
                     }
+                    if (applied > 0) {
+                        writeMeta(db, META_DOCUMENT, doc.take(MAX_DOC_CHARS))
+                        writeMeta(db, META_SIGNATURE, signature)
+                    }
+                    applied
+                } catch (_: Exception) {
+                    0
                 }
-                applied
             }
         }
     }
 
-    fun promptBlock(maxChars: Int = 1100): String {
-        val db = readable() ?: return ""
-        val items = synchronized(lock) {
-            val out = mutableListOf<MemoryItem>()
-            val cursor = try {
-                db.query(
-                    TABLE_MEMORIES,
-                    arrayOf("id", "type", "key", "value", "importance", "updated_at", "title", "category"),
-                    null, null, null, null, RANK_ORDER, "60"
-                )
-            } catch (_: Exception) {
-                return@synchronized out
-            }
-            cursor.use {
-                while (it.moveToNext()) {
-                    out.add(readItem(it))
-                }
-            }
-            out
-        }
-        if (items.isEmpty()) return ""
-
-        val grouped = LinkedHashMap<String, MutableList<MemoryItem>>()
-        for (item in items) {
-            grouped.getOrPut(displayCategory(item)) { mutableListOf() }.add(item)
-        }
-        val ordered = grouped.entries.sortedBy { entry ->
-            val index = categories.indexOf(entry.key)
-            if (index < 0) categories.size else index
-        }
-
+    fun promptBlock(maxChars: Int = 1600): String {
+        val doc = document().trim()
+        if (doc.isEmpty()) return ""
         val header = "PERSISTENT MEMORY about the user from earlier conversations. " +
             "Use it naturally and never recite or list it. " +
             "If the user corrects a detail, follow the newest value.\n"
-        val body = StringBuilder()
-        val used = mutableListOf<Long>()
-
-        for ((category, values) in ordered) {
-            val categoryLine = "[$category]"
-            if (header.length + body.length + categoryLine.length + 2 > maxChars) break
-            body.append(categoryLine).append('\n')
-            for (item in values) {
-                val title = displayTitle(item)
-                val full = item.value.trim()
-                val shown = if (full.length > 220) full.take(217).trimEnd() + "..." else full
-                val line = "- $title: $shown"
-                if (header.length + body.length + line.length + 2 > maxChars) break
-                body.append(line).append('\n')
-                if (shown == full) used.add(item.id)
-            }
-        }
-        if (body.length == 0) return ""
-
-        if (used.isNotEmpty()) {
-            val writableDb = writable()
-            if (writableDb != null) {
-                synchronized(lock) {
-                    try {
-                        touch(writableDb, used)
-                    } catch (_: Exception) {
-                    }
-                }
-            }
-        }
-        return header + body.toString().trimEnd()
+        val budget = (maxChars - header.length).coerceAtLeast(200)
+        val body = if (doc.length > budget) doc.take(budget).trimEnd() else doc
+        return header + body
     }
 
     fun snapshot(): List<MemoryItem> {
@@ -226,13 +257,127 @@ object MemoryStore {
         }
     }
 
+    private fun currentDocument(db: SQLiteDatabase): String =
+        readMeta(db, META_DOCUMENT) ?: buildDocumentFromRows(db)
+
+    private fun buildDocumentFromRows(db: SQLiteDatabase): String {
+        var doc = ""
+        val cursor = try {
+            db.query(
+                TABLE_MEMORIES,
+                arrayOf("id", "type", "key", "value", "importance", "updated_at", "title", "category"),
+                null, null, null, null, RANK_ORDER
+            )
+        } catch (_: Exception) {
+            return ""
+        }
+        cursor.use {
+            while (it.moveToNext()) {
+                doc = mergeLine(doc, lineForItem(readItem(it)))
+            }
+        }
+        return doc
+    }
+
+    private fun lineForItem(item: MemoryItem): String {
+        val value = item.value.trim()
+        if (value.isEmpty()) return ""
+        if (item.key.startsWith("manual:")) {
+            val title = item.title.trim()
+            if (title.isEmpty()) return value
+            if (normalize(title) == normalize(value)) return title
+            if (containsWords(normalize(title), normalize(value))) return title
+            return "$title: $value"
+        }
+        return documentLine(item.type, item.key, value)
+    }
+
+    private fun documentLine(type: String, key: String, rawValue: String): String {
+        val value = rawValue.trim().replace(Regex("\\s+"), " ")
+        if (value.isEmpty()) return ""
+        val label = when (type) {
+            "identity" -> when (key) {
+                "name" -> "Name"
+                "birthday" -> "Birthday"
+                else -> ""
+            }
+            "location" -> "City"
+            "work" -> "Work"
+            "education" -> "Education"
+            "preference" -> when {
+                key.startsWith("like:") -> "Likes"
+                key.startsWith("dislike:") -> "Dislikes"
+                else -> "Preference"
+            }
+            "project" -> "Project"
+            "goal" -> "Goal"
+            else -> ""
+        }
+        return if (label.isEmpty()) value else "$label: $value"
+    }
+
+    private fun mergeLine(doc: String, line: String): String {
+        val newLine = line.trim()
+        if (newLine.isEmpty()) return doc
+        if (MemoryExtractor.isSensitiveValue(newLine)) return doc
+        val newCore = lineCore(newLine)
+        if (newCore.isEmpty()) return doc
+        val lines = doc.lines().map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+        var index = 0
+        while (index < lines.size) {
+            val oldCore = lineCore(lines[index])
+            when {
+                oldCore == newCore -> return doc
+                containsWords(oldCore, newCore) -> return doc
+                containsWords(newCore, oldCore) -> {
+                    lines[index] = newLine
+                    return lines.joinToString("\n")
+                }
+            }
+            index++
+        }
+        lines.add(newLine)
+        return lines.joinToString("\n")
+    }
+
+    private fun lineCore(line: String): String {
+        val body = line.trim().removePrefix("-").trim()
+        val separator = body.indexOf(": ")
+        val value = if (separator >= 0) body.substring(separator + 2) else body
+        return normalize(value)
+    }
+
+    private fun containsWords(haystack: String, needle: String): Boolean {
+        if (haystack.isBlank() || needle.isBlank()) return false
+        return " $haystack ".contains(" $needle ")
+    }
+
+    private fun forgetFromDocument(doc: String, query: String): Pair<String, Int> {
+        val tokens = normalize(query).split(' ').filter { it.length >= 2 && it !in STOPWORDS }
+        if (tokens.isEmpty()) return doc to 0
+        val kept = mutableListOf<String>()
+        var removed = 0
+        for (line in doc.lines()) {
+            if (line.isBlank()) continue
+            val normalized = normalize(line)
+            if (tokens.any { " $normalized ".contains(" $it ") }) {
+                removed++
+            } else {
+                kept.add(line.trim())
+            }
+        }
+        return kept.joinToString("\n") to removed
+    }
+
+    private fun cleanDocument(text: String): String =
+        text.lines().map { it.trimEnd() }.joinToString("\n").trim().take(MAX_DOC_CHARS)
+
     fun addManual(title: String, content: String, category: String): Long {
         val db = writable() ?: return -1L
         val cleanTitle = title.trim().take(120)
         val cleanContent = content.trim().take(2000)
         if (cleanTitle.isBlank() || cleanContent.isBlank()) return -1L
-        val chosen = category.trim().ifBlank { "Other" }
-        val safeCategory = categories.firstOrNull { it.equals(chosen, ignoreCase = true) } ?: "Other"
+        val safeCategory = normalizeCategory(category)
         val now = System.currentTimeMillis()
         val key = "manual:" + UUID.randomUUID().toString().take(12)
         return synchronized(lock) {
@@ -241,7 +386,7 @@ object MemoryStore {
                     put("type", typeForCategory(safeCategory))
                     put("key", key)
                     put("value", cleanContent)
-                    put("importance", 3)
+                    put("importance", importanceForCategory(safeCategory))
                     put("confidence", 1.0)
                     put("source", SOURCE_MANUAL)
                     put("created_at", now)
@@ -264,14 +409,14 @@ object MemoryStore {
         val cleanTitle = title.trim().take(120)
         val cleanContent = content.trim().take(2000)
         if (cleanTitle.isBlank() || cleanContent.isBlank()) return false
-        val chosen = category.trim().ifBlank { "Other" }
-        val safeCategory = categories.firstOrNull { it.equals(chosen, ignoreCase = true) } ?: "Other"
+        val safeCategory = normalizeCategory(category)
         return synchronized(lock) {
             try {
                 val values = ContentValues().apply {
                     put("title", cleanTitle)
                     put("value", cleanContent)
                     put("category", safeCategory)
+                    put("importance", importanceForCategory(safeCategory))
                     put("updated_at", System.currentTimeMillis())
                 }
                 db.update(TABLE_MEMORIES, values, "id = ?", arrayOf(id.toString())) > 0
@@ -348,6 +493,8 @@ object MemoryStore {
         val now = System.currentTimeMillis()
         val importance = entry.importance.coerceIn(1, 5)
         val confidence = entry.confidence.coerceIn(0.0, 1.0)
+        val category = categoryForEntry(entry.type, importance)
+        val title = titleFor(entry.type, key)
         var wrote = 0
         val cursor = db.query(
             TABLE_MEMORIES,
@@ -365,6 +512,8 @@ object MemoryStore {
                     put("importance", maxOf(oldImportance, importance))
                     put("confidence", confidence)
                     put("updated_at", now)
+                    put("category", category)
+                    put("title", title)
                 }
                 wrote = db.update(TABLE_MEMORIES, values, "id = ?", arrayOf(id.toString()))
             } else {
@@ -378,6 +527,8 @@ object MemoryStore {
                     put("created_at", now)
                     put("updated_at", now)
                     put("last_used_at", 0L)
+                    put("category", category)
+                    put("title", title)
                 }
                 wrote = if (db.insert(TABLE_MEMORIES, null, values) > 0) 1 else 0
             }
@@ -469,34 +620,35 @@ object MemoryStore {
     fun displayTitle(item: MemoryItem): String {
         val stored = item.title.trim()
         if (stored.isNotEmpty()) return stored
-        return when (item.type) {
-            "identity" -> when (item.key) {
-                "name" -> "Name"
-                "birthday" -> "Birthday"
-                else -> "Identity"
-            }
-            "location" -> if (item.key == "city") "City" else "Location"
-            "work" -> "Work"
-            "education" -> "Education"
-            "preference" -> when {
-                item.key.startsWith("like:") ->
-                    "Like: " + humanizeSlot(item.key.removePrefix("like:"))
-                item.key.startsWith("dislike:") ->
-                    "Dislike: " + humanizeSlot(item.key.removePrefix("dislike:"))
-                else -> "Preference"
-            }
-            "project" -> "Project: " + humanizeSlot(item.key.removePrefix("project:"))
-            "note" -> {
-                val slot = humanizeSlot(item.key.removePrefix("note:"))
-                if (slot.isBlank() || slot.equals("Entry", ignoreCase = true)) "Note" else "Note: $slot"
-            }
-            else -> {
-                val slot = humanizeSlot(item.key)
-                if (slot.isNotBlank()) {
-                    slot
-                } else {
-                    item.type.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
-                }
+        return titleFor(item.type, item.key)
+    }
+
+    private fun titleFor(type: String, key: String): String = when (type) {
+        "identity" -> when (key) {
+            "name" -> "Name"
+            "birthday" -> "Birthday"
+            else -> "Identity"
+        }
+        "location" -> if (key == "city") "City" else "Location"
+        "work" -> "Work"
+        "education" -> "Education"
+        "preference" -> when {
+            key.startsWith("like:") -> "Like: " + humanizeSlot(key.removePrefix("like:"))
+            key.startsWith("dislike:") -> "Dislike: " + humanizeSlot(key.removePrefix("dislike:"))
+            else -> "Preference"
+        }
+        "project" -> "Project: " + humanizeSlot(key.removePrefix("project:"))
+        "goal" -> "Goal: " + humanizeSlot(key.removePrefix("goal:"))
+        "note" -> {
+            val slot = humanizeSlot(key.removePrefix("note:"))
+            if (slot.isBlank() || slot.equals("Entry", ignoreCase = true)) "Note" else "Note: $slot"
+        }
+        else -> {
+            val slot = humanizeSlot(key)
+            if (slot.isNotBlank()) {
+                slot
+            } else {
+                type.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
             }
         }
     }
@@ -511,25 +663,45 @@ object MemoryStore {
     fun displayCategory(item: MemoryItem): String {
         val stored = item.category.trim()
         if (stored.isNotEmpty()) {
-            return categories.firstOrNull { it.equals(stored, ignoreCase = true) } ?: "Other"
+            categories.firstOrNull { it.equals(stored, ignoreCase = true) }?.let { return it }
+            when (stored.lowercase()) {
+                "important notes", "important note", "important" -> return "Important"
+                "preferences", "work", "study", "personal" -> return "Personal"
+                "other", "others" -> return "Others"
+            }
         }
-        return when (item.type) {
-            "identity", "location" -> "Personal"
-            "preference" -> "Preferences"
-            "work", "project" -> "Work"
-            "education" -> "Study"
-            "note" -> "Important Notes"
-            else -> "Other"
-        }
+        return categoryForEntry(item.type, item.importance)
+    }
+
+    private fun categoryForEntry(type: String, importance: Int): String = when (type) {
+        "identity", "project", "goal" -> "Important"
+        "preference" -> if (importance >= 4) "Important" else "Personal"
+        "location", "work", "education" -> "Personal"
+        "note" -> if (importance >= 4) "Important" else "Others"
+        else -> "Others"
+    }
+
+    private fun normalizeCategory(category: String): String {
+        val chosen = category.trim()
+        return categories.firstOrNull { it.equals(chosen, ignoreCase = true) }
+            ?: when (chosen.lowercase()) {
+                "important notes", "important note", "important" -> "Important"
+                "preferences", "work", "study", "personal" -> "Personal"
+                "other", "others" -> "Others"
+                else -> "Others"
+            }
     }
 
     private fun typeForCategory(category: String): String = when (category) {
         "Personal" -> "identity"
-        "Preferences" -> "preference"
-        "Work" -> "work"
-        "Study" -> "education"
-        "Important Notes", "Other" -> "note"
+        "Important", "Others" -> "note"
         else -> "note"
+    }
+
+    private fun importanceForCategory(category: String): Int = when (category) {
+        "Important" -> 5
+        "Personal" -> 4
+        else -> 3
     }
 
     private fun touch(db: SQLiteDatabase, ids: List<Long>) {
@@ -599,6 +771,23 @@ object MemoryStore {
             if (oldVersion < 2) {
                 db.execSQL("ALTER TABLE $TABLE_MEMORIES ADD COLUMN title TEXT NOT NULL DEFAULT ''")
                 db.execSQL("ALTER TABLE $TABLE_MEMORIES ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+            }
+            if (oldVersion < 3) {
+                db.execSQL("UPDATE $TABLE_MEMORIES SET category = 'Personal' WHERE category IN ('Preferences', 'Work', 'Study')")
+                db.execSQL("UPDATE $TABLE_MEMORIES SET category = 'Important' WHERE category = 'Important Notes'")
+            }
+            if (oldVersion < 4) {
+                db.execSQL("UPDATE $TABLE_MEMORIES SET category = 'Others' WHERE lower(category) = 'other'")
+                db.execSQL(
+                    "UPDATE $TABLE_MEMORIES SET category = CASE " +
+                        "WHEN type IN ('identity', 'project', 'goal') THEN 'Important' " +
+                        "WHEN type IN ('location', 'work', 'education') THEN 'Personal' " +
+                        "WHEN type = 'preference' AND importance >= 4 THEN 'Important' " +
+                        "WHEN type = 'preference' THEN 'Personal' " +
+                        "WHEN type = 'note' AND importance >= 4 THEN 'Important' " +
+                        "ELSE 'Others' END " +
+                        "WHERE category = '' OR category IS NULL"
+                )
             }
         }
     }

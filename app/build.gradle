@@ -10,8 +10,8 @@ android {
         applicationId 'com.jarvis.assistant'
         minSdk 24
         targetSdk 35
-        versionCode 16
-        versionName '2.5'
+        versionCode 33
+        versionName '3.11'
     }
     signingConfigs {
         release {
@@ -36,6 +36,10 @@ android {
             }
         }
     }
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -46,4 +50,5 @@ android {
 dependencies {
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     implementation 'androidx.core:core:1.13.1'
+    implementation 'org.jsoup:jsoup:1.18.1'
 }

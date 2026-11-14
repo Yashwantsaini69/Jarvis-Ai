@@ -13,6 +13,9 @@ import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class GeminiLiveClient(
@@ -35,6 +38,7 @@ class GeminiLiveClient(
         fun onVoiceActivity(active: Boolean)
         fun onGoAway(secondsLeft: Long)
         fun onSessionResumption(handle: String, resumable: Boolean) {}
+        fun onAppCommand(name: String) {}
         fun onClosed(reason: String)
         fun onError(message: String)
     }
@@ -57,6 +61,11 @@ class GeminiLiveClient(
     private var setupComplete = false
 
     private var closeReason = ""
+
+    private val cancelledCalls: MutableSet<String> =
+        Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
+    private val searchExecutor = Executors.newSingleThreadExecutor()
 
     private companion object {
         const val EXTENDED_THINKING_MODEL = "gemini-3.8-live-extended-thinking"
@@ -107,6 +116,7 @@ class GeminiLiveClient(
         closed = true
         val ws = webSocket
         webSocket = null
+        searchExecutor.shutdownNow()
         try {
             ws?.close(1000, "Session ended")
         } catch (_: Throwable) {
@@ -144,8 +154,15 @@ class GeminiLiveClient(
         val realtimeInputConfig = JSONObject()
             .put("automaticActivityDetection", activityDetection)
 
+        val functions = appFunctionDeclarations()
+        functions.put(searchFunctionDeclaration())
+        val tools = JSONArray().put(
+            JSONObject().put("functionDeclarations", functions)
+        )
+
         val setup = JSONObject()
             .put("model", modelName)
+            .put("tools", tools)
             .put("generationConfig", generationConfig)
             .put(
                 "systemInstruction",
@@ -163,6 +180,141 @@ class GeminiLiveClient(
             )
 
         return JSONObject().put("setup", setup).toString()
+    }
+
+    private fun appFunctionDeclarations(): JSONArray = JSONArray().apply {
+        put(appFunction("open_chat", "Open the in-app chat/transcript screen so the user can type and read messages. Call this when the user asks to open, start or show chat or transcript."))
+        put(appFunction("close_chat", "Close the in-app chat/transcript screen. Call this when the user asks to close, hide or stop chat or transcript."))
+        put(appFunction("open_settings", "Open the app Settings screen. Call this when the user asks to open settings, configuration or preferences."))
+        put(appFunction("open_memory", "Open the memory manager showing everything saved about the user. Call this when the user asks to open or manage memory."))
+        put(appFunction("open_notes", "Open the user's notepad with saved notes and reminders. Call this when the user asks to open notes, notepad or reminders."))
+        put(appFunction("mute_mic", "Mute the microphone. Call this when the user asks to mute the mic, turn the mic off, or stop listening."))
+        put(appFunction("unmute_mic", "Unmute the microphone. Call this when the user asks to unmute the mic or turn the mic on."))
+        put(appFunction("clear_chat", "Delete the saved live chat transcript history. Call this when the user asks to clear, delete or wipe the transcript or chat history."))
+        put(appFunction("open_multi_brain", "Open the Multi Brain Manager screen for AI providers, API keys and models."))
+        put(appFunction("change_orb", "Change the orb visual style to the next style. Call this when the user asks to change the orb, theme or look."))
+        put(appFunction("go_back", "Close the currently open screen or dialog, or go back."))
+    }
+
+    private fun appFunction(name: String, description: String): JSONObject =
+        JSONObject().put("name", name).put("description", description)
+
+    private fun isAppFunction(name: String): Boolean = name == "open_chat" ||
+        name == "close_chat" ||
+        name == "clear_chat" ||
+        name == "open_settings" ||
+        name == "open_memory" ||
+        name == "open_notes" ||
+        name == "open_multi_brain" ||
+        name == "change_orb" ||
+        name == "mute_mic" ||
+        name == "unmute_mic" ||
+        name == "go_back"
+
+    private fun searchFunctionDeclaration(): JSONObject {
+        val declaration = JSONObject()
+            .put("name", "web_search")
+            .put(
+                "description",
+                "Search the live web with DuckDuckGo for current or factual information such as " +
+                    "news, weather, prices, scores, releases or recent events. Never use it for " +
+                    "greetings or casual chat."
+            )
+            .put(
+                "parameters",
+                JSONObject()
+                    .put("type", "OBJECT")
+                    .put(
+                        "properties",
+                        JSONObject().put(
+                            "query",
+                            JSONObject().put("type", "STRING").put("description", "The search query")
+                        )
+                    )
+                    .put("required", JSONArray().put("query"))
+            )
+        if (model == EXTENDED_THINKING_MODEL) {
+            declaration.put("behavior", "NON_BLOCKING")
+        }
+        return declaration
+    }
+
+    private fun handleToolCalls(calls: JSONArray) {
+        for (i in 0 until calls.length()) {
+            val call = calls.optJSONObject(i) ?: continue
+            val id = call.optString("id", "")
+            val name = call.optString("name", "")
+            Log.d("JarvisLive", "toolCall name=$name id=$id")
+            if (isAppFunction(name)) {
+                handler.post { listener.onAppCommand(name) }
+                sendToolResponse(id, name, "ok")
+            } else if (name != "web_search") {
+                sendToolResponse(id, name, "Unknown tool: $name")
+            } else {
+                val args = call.optJSONObject("args") ?: JSONObject()
+                var query = args.optString("query", "")
+                if (query.isBlank()) query = args.toString()
+                val finalQuery = query
+                searchExecutor.execute {
+                    if (cancelledCalls.contains(id)) return@execute
+                    val results = try {
+                        DuckDuckGoSearch.search(finalQuery)
+                    } catch (_: Throwable) {
+                        emptyList()
+                    }
+                    if (cancelledCalls.contains(id)) return@execute
+                    sendToolResponse(id, name, searchPayload(finalQuery, results))
+                }
+            }
+        }
+    }
+
+    private fun searchPayload(
+        query: String,
+        results: List<DuckDuckGoSearch.Result>
+    ): String {
+        if (results.isEmpty()) {
+            return "No live web results found for \"$query\"."
+        }
+        val builder = StringBuilder("Live web results for \"$query\":\n")
+        results.take(4).forEachIndexed { index, result ->
+            builder.append("\n${index + 1}. ${result.title}\n")
+            if (result.snippet.isNotBlank()) {
+                builder.append("Snippet: ${result.snippet}\n")
+            }
+            if (result.content.isNotBlank()) {
+                builder.append("Extracted page content: ${result.content}\n")
+            }
+            builder.append(result.url).append("\n")
+        }
+        builder.append(
+            "\nAnswer the user directly from this extracted content. Do not just name the " +
+                "website or tell the user to visit it. Briefly mention the source website. If the " +
+                "extracted content is missing or unrelated, say so clearly."
+        )
+        return builder.toString()
+    }
+
+    private fun sendToolResponse(id: String, name: String, result: String) {
+        val ws = webSocket ?: return
+        if (!setupComplete || closed) return
+        try {
+            val payload = JSONObject().put("result", result)
+            if (model == EXTENDED_THINKING_MODEL) {
+                payload.put("scheduling", "INTERRUPT")
+            }
+            val response = JSONObject().put(
+                "toolResponse",
+                JSONObject().put(
+                    "functionResponses",
+                    JSONArray().put(
+                        JSONObject().put("id", id).put("name", name).put("response", payload)
+                    )
+                )
+            )
+            ws.send(response.toString())
+        } catch (_: Throwable) {
+        }
     }
 
     private val socketListener = object : WebSocketListener() {
@@ -227,6 +379,16 @@ class GeminiLiveClient(
                 setupComplete = true
                 handler.post { listener.onSetupComplete() }
                 return
+            }
+
+            obj.optJSONObject("toolCall")?.optJSONArray("functionCalls")?.let { calls ->
+                handleToolCalls(calls)
+            }
+
+            obj.optJSONObject("toolCallCancellation")?.optJSONArray("ids")?.let { ids ->
+                for (i in 0 until ids.length()) {
+                    cancelledCalls.add(ids.optString(i))
+                }
             }
 
             obj.optJSONObject("serverContent")?.let { content ->

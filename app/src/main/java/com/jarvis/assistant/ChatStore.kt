@@ -132,18 +132,20 @@ object ChatStore {
         persist()
     }
 
-    fun addUserText(text: String) {
+    fun addUserText(text: String): Long {
         val clean = text.trim()
-        if (clean.isEmpty()) return
+        if (clean.isEmpty()) return 0L
+        val id: Long
         synchronized(this) {
             finalizeAssistantLocked()
             finalizeUserLocked()
             resetUserLocked()
-            val id = nextId++
+            id = nextId++
             messages.add(Message(id, Role.USER, clean, true, System.currentTimeMillis()))
         }
         notifyListeners()
         persist()
+        return id
     }
 
     fun setAssistantSource(source: String) {

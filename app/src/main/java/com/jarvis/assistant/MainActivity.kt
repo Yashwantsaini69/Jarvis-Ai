@@ -3,18 +3,27 @@ package com.jarvis.assistant
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.text.TextUtils
+import android.util.Log
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : Activity() {
     private enum class UiMode { IDLE, CONNECTING, ACTIVE, ERROR }
@@ -23,7 +32,6 @@ class MainActivity : Activity() {
     private lateinit var statusLabel: TextView
     private lateinit var statusDetail: TextView
     private lateinit var latest: TextView
-    private lateinit var startButton: JarvisButton
     private lateinit var chatButton: JarvisButton
     private lateinit var micButton: JarvisButton
 
@@ -36,13 +44,28 @@ class MainActivity : Activity() {
     private var startupHandle = ""
     private var autoRecovered = false
     private var micMuted = false
+    private var chatDialog: ChatDialog? = null
+    private var modalDialog: Dialog? = null
+    private var modalKey: String? = null
+    private var lastActionName = ""
+    private var lastActionAt = 0L
+    private var lastNoteSignature = ""
+    private var lastNoteAt = 0L
+    private var lastReminderSignature = ""
+    private var lastReminderAt = 0L
+    private val assistantTurnText = StringBuilder()
     private var connectionWatchdog: Runnable? = null
     private var updatePromptVisible = false
     private var connectedSoundPlayed = false
     private var disconnectedSoundPlayed = false
+    private var homeBaselineTime = 0L
 
     private val chatListener = ChatStore.Listener {
         runOnUiThread { updateLatest() }
+    }
+
+    private val reminderListener = ReminderBus.Listener { note ->
+        runOnUiThread { announceReminder(note) }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -50,17 +73,36 @@ class MainActivity : Activity() {
         JarvisPrefs.init(applicationContext)
         ChatStore.init(applicationContext)
         MemoryStore.init(applicationContext)
+        NoteStore.init(applicationContext)
+        ReminderNotifier.ensureChannel(applicationContext)
+        ReminderScheduler.rescheduleAll(applicationContext)
+        ReminderBus.addListener(reminderListener)
+        resetStaleSessionIfUpdated()
+        homeBaselineTime = System.currentTimeMillis()
         ChatStore.beginSession()
         window.statusBarColor = Palette.bg
         window.navigationBarColor = Palette.bg
         buildUi()
         applyIdleUi(firstRun = true)
+        val openNotesFromIntent = intent?.getBooleanExtra("open_notes", false) == true
+        if (openNotesFromIntent) intent.removeExtra("open_notes")
+        if (openNotesFromIntent) window.decorView.post { openNotes() }
+        window.decorView.postDelayed({
+            if (!isFinishing && !isDestroyed && !active && !connecting) startFlow()
+        }, 150L)
         window.decorView.postDelayed({ checkForUpdates(manual = false) }, 1500L)
     }
 
     override fun onStart() {
         super.onStart()
         ChatStore.addListener(chatListener)
+        if (!active && !connecting) {
+            statusLabel.text = "STANDBY"
+            statusLabel.setTextColor(Palette.cyan)
+            statusDetail.text =
+                if (JarvisPrefs.hasApiKey()) "Secure voice link ready"
+                else "Add your Gemini API key in Settings"
+        }
         updateLatest()
     }
 
@@ -70,6 +112,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        ReminderBus.removeListener(reminderListener)
         if (client != null || audio != null) {
             stopRequested = true
             releaseSession()
@@ -77,6 +120,28 @@ class MainActivity : Activity() {
         }
         JarvisSessionService.stop(this)
         super.onDestroy()
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent?.getBooleanExtra("open_notes", false) == true) {
+            intent.removeExtra("open_notes")
+            openNotes()
+        }
+    }
+
+    private fun resetStaleSessionIfUpdated() {
+        val version = try {
+            packageManager.getPackageInfo(packageName, 0).versionCode
+        } catch (_: Throwable) {
+            0
+        }
+        if (version <= 0) return
+        if (JarvisPrefs.lastVersionCode != version) {
+            JarvisPrefs.clearSessionHandle()
+            JarvisPrefs.lastVersionCode = version
+        }
     }
 
     private fun buildUi() {
@@ -118,6 +183,22 @@ class MainActivity : Activity() {
         orb = OrbView(this).apply {
             orbStyle = JarvisPrefs.orbStyle
             mode = OrbView.Mode.IDLE
+            contentDescription = "Start or stop live session"
+            setOnClickListener { toggleSession() }
+            setOnTouchListener { view, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> view.animate()
+                        .scaleX(0.95f).scaleY(0.95f).alpha(0.85f)
+                        .setDuration(90L)
+                        .start()
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> view.animate()
+                        .scaleX(1f).scaleY(1f).alpha(1f)
+                        .setDuration(180L)
+                        .setInterpolator(OvershootInterpolator(2.5f))
+                        .start()
+                }
+                false
+            }
         }
         center.addView(orb, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
@@ -142,22 +223,25 @@ class MainActivity : Activity() {
         }
         bottom.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
 
-        startButton = JarvisButton(this, dp(78f), Palette.cyan, 0).apply {
-            contentDescription = "Start live session"
-            setLabel("START", Palette.ice)
-            setOnClickListener { toggleSession() }
-        }
-        bottom.addView(startButton, LinearLayout.LayoutParams(dp(78f), dp(78f)))
-
         val sideControls = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.END
         }
-        chatButton = JarvisButton(this, dp(52f), Palette.cyanDim, R.drawable.ic_chat).apply {
-            contentDescription = "Open live transcript"
-            setOnClickListener { ChatDialog(this@MainActivity).show() }
+        val notesButton = JarvisButton(this, dp(52f), Palette.cyanDim, R.drawable.ic_note).apply {
+            contentDescription = "Notepad"
+            setOnClickListener { openNotes() }
         }
-        sideControls.addView(chatButton, LinearLayout.LayoutParams(dp(52f), dp(52f)))
+        sideControls.addView(notesButton, LinearLayout.LayoutParams(dp(52f), dp(52f)))
+
+        chatButton = JarvisButton(this, dp(52f), Palette.cyanDim, R.drawable.ic_chat).apply {
+            contentDescription = "Toggle live transcript"
+            setOnClickListener {
+                if (chatDialog?.isShowing == true) closeChat() else showChat()
+            }
+        }
+        sideControls.addView(chatButton, LinearLayout.LayoutParams(dp(52f), dp(52f)).apply {
+            topMargin = dp(8f)
+        })
 
         micButton = JarvisButton(this, dp(60f), Palette.cyanDim, R.drawable.ic_mic).apply {
             contentDescription = "Mute microphone"
@@ -236,10 +320,11 @@ class MainActivity : Activity() {
         stopRequested = false
         connectedSoundPlayed = false
         disconnectedSoundPlayed = false
+        assistantTurnText.setLength(0)
         uiMode = UiMode.CONNECTING
         orb.mode = OrbView.Mode.CONNECTING
         orb.setLevel(0f)
-        statusLabel.text = "INITIALIZING"
+        statusLabel.text = "CONNECTING"
         statusLabel.setTextColor(Palette.cyan)
         startupHandle = JarvisPrefs.sessionHandle
         statusDetail.text = if (startupHandle.isNotBlank()) {
@@ -249,9 +334,6 @@ class MainActivity : Activity() {
         }
         micMuted = false
         updateMicButton()
-        startButton.setLabel("END", Palette.ice)
-        startButton.accentColor = Palette.gold
-        startButton.contentDescription = "End live session"
         JarvisSessionService.start(this)
 
         audio = AudioEngine(
@@ -263,10 +345,11 @@ class MainActivity : Activity() {
         )
 
         val memoryBlock = MemoryStore.promptBlock()
+        val baseInstruction = JarvisPrefs.effectiveInstruction() + "\n\n" + APP_CONTROL_INSTRUCTION
         val systemInstruction = if (memoryBlock.isBlank()) {
-            JarvisPrefs.effectiveInstruction()
+            baseInstruction
         } else {
-            JarvisPrefs.effectiveInstruction() + "\n\n" + memoryBlock
+            baseInstruction + "\n\n" + memoryBlock
         }
         client = GeminiLiveClient(
             JarvisPrefs.apiKey,
@@ -334,9 +417,6 @@ class MainActivity : Activity() {
         uiMode = UiMode.ERROR
         orb.mode = OrbView.Mode.ERROR
         orb.setLevel(0f)
-        startButton.setLabel("START", Palette.ice)
-        startButton.accentColor = Palette.cyan
-        startButton.contentDescription = "Start live session"
         micMuted = false
         updateMicButton()
         statusLabel.text = title
@@ -353,9 +433,6 @@ class MainActivity : Activity() {
         ChatStore.sessionActive = false
         orb.mode = OrbView.Mode.IDLE
         orb.setLevel(0f)
-        startButton.setLabel("START", Palette.ice)
-        startButton.accentColor = Palette.cyan
-        startButton.contentDescription = "Start live session"
         micMuted = false
         updateMicButton()
         statusLabel.text = "STANDBY"
@@ -381,41 +458,304 @@ class MainActivity : Activity() {
             toast("Start a live session to use the mic toggle")
             return
         }
-        micMuted = !micMuted
+        setMicMuted(!micMuted)
+        toast(if (micMuted) "Microphone muted" else "Microphone on")
+    }
+
+    private fun setMicMuted(muted: Boolean) {
+        if (micMuted == muted) return
+        micMuted = muted
         updateMicButton()
-        if (micMuted) {
+        if (muted) {
             orb.setLevel(0f)
             if (active) {
                 statusLabel.text = "MUTED"
                 statusLabel.setTextColor(Palette.gold)
                 statusDetail.text = "Microphone off — tap the mic to speak"
             }
-            toast("Microphone muted")
-        } else {
-            if (active) {
-                orb.mode = OrbView.Mode.LISTENING
-                statusLabel.text = "ONLINE"
-                statusLabel.setTextColor(Palette.cyan)
-                statusDetail.text = "Listening — speak naturally"
-            }
-            toast("Microphone on")
+        } else if (active) {
+            orb.mode = OrbView.Mode.LISTENING
+            statusLabel.text = "ONLINE"
+            statusLabel.setTextColor(Palette.cyan)
+            statusDetail.text = "Listening — speak naturally"
         }
+    }
+
+    private fun showChat() {
+        val existing = chatDialog
+        if (existing != null && existing.isShowing) return
+        val dialog = ChatDialog(this) { text -> sendTextToLive(text) }
+        dialog.setOnDismissListener {
+            if (chatDialog === dialog) chatDialog = null
+        }
+        chatDialog = dialog
+        dialog.show()
+    }
+
+    private fun closeChat() {
+        val dialog = chatDialog ?: return
+        chatDialog = null
+        if (dialog.isShowing) dialog.dismiss()
+    }
+
+    private fun performAppAction(action: AppCommandRouter.Action) {
+        Log.d("JarvisDebug", "perform action ${action.name}")
+        val now = SystemClock.elapsedRealtime()
+        if (action.name == lastActionName && now - lastActionAt < 1800L) return
+        lastActionName = action.name
+        lastActionAt = now
+        when (action) {
+            AppCommandRouter.Action.OPEN_CHAT -> {
+                showChat()
+                toast("Opening chat")
+            }
+            AppCommandRouter.Action.CLOSE_CHAT -> {
+                closeChat()
+                toast("Chat closed")
+            }
+            AppCommandRouter.Action.CLEAR_CHAT -> clearChat()
+            AppCommandRouter.Action.OPEN_SETTINGS -> showSettings()
+            AppCommandRouter.Action.OPEN_MEMORY -> openMemory()
+            AppCommandRouter.Action.OPEN_NOTES -> openNotes()
+            AppCommandRouter.Action.OPEN_MULTIBRAIN -> openMultiBrain()
+            AppCommandRouter.Action.CYCLE_ORB -> cycleOrb()
+            AppCommandRouter.Action.MUTE_MIC -> {
+                setMicMuted(true)
+                toast("Microphone muted")
+            }
+            AppCommandRouter.Action.UNMUTE_MIC -> {
+                setMicMuted(false)
+                toast("Microphone on")
+            }
+            AppCommandRouter.Action.BACK -> goBack()
+        }
+    }
+
+    private fun showModal(key: String, create: () -> Dialog) {
+        val existing = modalDialog
+        if (existing != null && existing.isShowing) {
+            if (modalKey == key) return
+            existing.dismiss()
+            modalDialog = null
+        }
+        val dialog = create()
+        dialog.setOnDismissListener {
+            if (modalDialog === dialog) {
+                modalDialog = null
+                modalKey = null
+            }
+        }
+        modalDialog = dialog
+        modalKey = key
+        dialog.show()
+    }
+
+    private fun openMemory() {
+        showModal("memory") { MemoryManagerDialog(this) }
+    }
+
+    private fun openNotes() {
+        showModal("notes") { NotepadDialog(this) }
+    }
+
+    private fun openMultiBrain() {
+        showModal("multibrain") { MultiBrainManagerDialog(this) }
+    }
+
+    private fun clearChat() {
+        ChatStore.clear()
+        JarvisPrefs.clearSessionHandle()
+        toast("Transcript cleared")
+    }
+
+    private fun cycleOrb() {
+        val styles = JarvisPrefs.orbStyles
+        if (styles.isEmpty()) return
+        val next = (JarvisPrefs.orbStyle + 1) % styles.size
+        JarvisPrefs.orbStyle = next
+        orb.orbStyle = next
+        toast("Orb style: ${styles[next]}")
+    }
+
+    private fun goBack() {
+        if (chatDialog?.isShowing == true) {
+            closeChat()
+            toast("Chat closed")
+            return
+        }
+        val modal = modalDialog
+        if (modal != null && modal.isShowing) {
+            modal.dismiss()
+            return
+        }
+        toast("Nothing to close")
+    }
+
+    private fun detectSpokenAction(text: String) {
+        if (text.isBlank()) return
+        val t = text.lowercase()
+        if (listOf("can't", "cannot", "not able", "unable", "nahi", "नहीं").any { t.contains(it) }) return
+        fun has(vararg list: String) = list.any { t.contains(it) }
+        val openConfirm = arrayOf(
+            "opening", "opened", "is now open", "is open", "on ho gaya", "on kar diya",
+            "khol diya", "khol raha", "khol rahi", "खोल दिया", "चालू कर दिया", "चालू है", "खुल गया"
+        )
+        val closeConfirm = arrayOf(
+            "closing", "closed", "band kar diya", "band ho gaya", "band kar raha",
+            "बंद कर दिया", "बंद हो गया"
+        )
+        val clearConfirm = arrayOf(
+            "cleared", "deleted", "clear kar diya", "delete kar diya", "dlt kar diya",
+            "साफ कर दिया", "मिटा दिया"
+        )
+        val muteConfirm = arrayOf("muted", "microphone off", "mic off", "माइक बंद")
+        val unmuteConfirm = arrayOf("unmuted", "microphone on", "mic on", "माइक चालू")
+
+        val isChat = has("chat", "transcript", "चैट")
+        val isMemory = has("memory", "मेमोरी")
+        val isNotes = has("note", "notepad", "नोट")
+        val isSettings = has("settings", "setting", "सेटिंग")
+        val isMulti = has("multi brain", "multibrain", "brain manager")
+        val isMic = has("mic", "microphone", "माइक")
+
+        if (isChat && has(*clearConfirm)) {
+            performAppAction(AppCommandRouter.Action.CLEAR_CHAT)
+            return
+        }
+        if (isMemory && has(*openConfirm)) {
+            performAppAction(AppCommandRouter.Action.OPEN_MEMORY)
+            return
+        }
+        if (isNotes && has(*openConfirm)) {
+            performAppAction(AppCommandRouter.Action.OPEN_NOTES)
+            return
+        }
+        if (isSettings && has(*openConfirm)) {
+            performAppAction(AppCommandRouter.Action.OPEN_SETTINGS)
+            return
+        }
+        if (isMulti && has(*openConfirm)) {
+            performAppAction(AppCommandRouter.Action.OPEN_MULTIBRAIN)
+            return
+        }
+        if (isMic) {
+            if (has(*muteConfirm)) {
+                performAppAction(AppCommandRouter.Action.MUTE_MIC)
+                return
+            }
+            if (has(*unmuteConfirm)) {
+                performAppAction(AppCommandRouter.Action.UNMUTE_MIC)
+                return
+            }
+        }
+        if (isChat && has(*closeConfirm)) {
+            performAppAction(AppCommandRouter.Action.CLOSE_CHAT)
+            return
+        }
+        if (isChat && has(*openConfirm)) {
+            performAppAction(AppCommandRouter.Action.OPEN_CHAT)
+        }
+    }
+
+    private fun handleAppCommand(raw: String, allowNoteCreate: Boolean = true): Boolean {
+        if (allowNoteCreate && handleVoiceReminder(raw)) return true
+        if (allowNoteCreate && handleNoteCreation(raw)) return true
+        val action = AppCommandRouter.parse(raw)
+        Log.d("JarvisDebug", "parse '$raw' -> ${action?.name ?: "none"}")
+        if (action == null) return false
+        performAppAction(action)
+        return true
+    }
+
+    private fun handleVoiceReminder(raw: String): Boolean {
+        val parsed = VoiceReminderParser.parse(raw) ?: return false
+        val signature = parsed.title + "|" + parsed.atMillis
+        val now = SystemClock.elapsedRealtime()
+        if (signature == lastReminderSignature && now - lastReminderAt < 8000L) return true
+        val id = NoteStore.add(parsed.title, parsed.body, parsed.atMillis)
+        if (id <= 0L) return false
+        lastReminderSignature = signature
+        lastReminderAt = now
+        NoteStore.get(id)?.let { ReminderScheduler.schedule(applicationContext, it) }
+        val formatted = SimpleDateFormat("dd MMM, h:mm a", Locale.getDefault())
+            .format(Date(parsed.atMillis))
+        toast("Reminder set for $formatted")
+        openNotes()
+        return true
+    }
+
+    private fun announceReminder(note: NoteStore.Note) {
+        val live = client ?: return
+        if (!active) return
+        val title = note.title.ifBlank { "your task" }
+        val body = note.body.ifBlank { title }
+        val prompt = "[SYSTEM] The user's scheduled task is due now: \"$title\". " +
+            "Details: $body. Say one short sentence like: \"Sir, it's time for $title.\""
+        live.sendText(prompt)
+    }
+
+    private fun handleNoteCreation(raw: String): Boolean {
+        val lower = raw.lowercase()
+        val prefixes = listOf(
+            "note likho", "note likh", "note banao", "note bana", "note add",
+            "add note", "new note", "save note",
+            "नोट लिखो", "नोट बनाओ", "नोट ऐड"
+        )
+        for (prefix in prefixes) {
+            val index = lower.indexOf(prefix)
+            if (index < 0) continue
+            val text = raw.substring(index + prefix.length)
+                .trim(' ', ':', '-', ',', '.', '।')
+            if (text.length < 2) continue
+            val signature = text.lowercase()
+            val now = SystemClock.elapsedRealtime()
+            if (signature == lastNoteSignature && now - lastNoteAt < 8000L) return true
+            val title = text.take(60)
+            val id = NoteStore.add(title, text, 0L)
+            if (id > 0L) {
+                lastNoteSignature = signature
+                lastNoteAt = now
+                toast("Note saved")
+                openNotes()
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun sendTextToLive(text: String): Boolean {
+        val live = client ?: return false
+        if (!active || !live.sendText(text)) return false
+        handleAppCommand(text)
+        val id = ChatStore.addUserText(text)
+        if (id > 0) {
+            Thread {
+                try {
+                    MemoryStore.observeUserMessage(id, text, true)
+                } catch (_: Throwable) {
+                }
+            }.start()
+        }
+        updateLatest()
+        return true
     }
 
     private fun rememberCompletedSpeech() {
         val last = ChatStore.snapshot().lastOrNull {
             it.role == ChatStore.Role.USER && it.final && it.text.isNotBlank()
         } ?: return
-        try {
-            MemoryStore.observeUserMessage(last.id, last.text, last.final)
-        } catch (_: Exception) {
-        }
+        Thread {
+            try {
+                MemoryStore.observeUserMessage(last.id, last.text, last.final)
+            } catch (_: Exception) {
+            }
+        }.start()
     }
 
     private fun updateLatest() {
         if (!::latest.isInitialized) return
         val last = ChatStore.latest()
-        if (last == null) {
+        if (last == null || last.time < homeBaselineTime) {
             latest.text = "Live transcript will appear here"
             latest.setTextColor(Palette.textFaint)
         } else {
@@ -426,15 +766,19 @@ class MainActivity : Activity() {
     }
 
     private fun showSettings() {
-        SettingsDialog(this, {
-            orb.orbStyle = JarvisPrefs.orbStyle
-            if (!active && !connecting) {
-                statusDetail.text = if (JarvisPrefs.hasApiKey()) "Configuration updated — ready when you are" else "Add your Gemini API key in Settings"
-            }
-            toast("Configuration saved")
-        }, {
-            checkForUpdates(manual = true)
-        }).show()
+        showModal("settings") {
+            SettingsDialog(this, {
+                orb.orbStyle = JarvisPrefs.orbStyle
+                if (!active && !connecting) {
+                    statusDetail.text =
+                        if (JarvisPrefs.hasApiKey()) "Configuration updated — ready when you are"
+                        else "Add your Gemini API key in Settings"
+                }
+                toast("Configuration saved")
+            }, {
+                checkForUpdates(manual = true)
+            })
+        }
     }
 
     private fun checkForUpdates(manual: Boolean) {
@@ -543,7 +887,15 @@ class MainActivity : Activity() {
         }
 
         override fun onInputTranscript(text: String, finished: Boolean) {
+            Log.d("JarvisDebug", "input final=$finished text=$text")
             ChatStore.appendUserFinal(text, finished)
+            if (finished) {
+                rememberCompletedSpeech()
+                val last = ChatStore.snapshot().lastOrNull {
+                    it.role == ChatStore.Role.USER && it.final && it.text.isNotBlank()
+                }
+                if (last != null) handleAppCommand(last.text)
+            }
             if (active) {
                 orb.mode = OrbView.Mode.LISTENING
                 statusLabel.text = "LISTENING"
@@ -554,7 +906,11 @@ class MainActivity : Activity() {
         }
 
         override fun onInterimInputTranscript(text: String) {
+            Log.d("JarvisDebug", "interim text=$text")
             ChatStore.appendUserInterim(text)
+            ChatStore.latest()
+                ?.takeIf { it.role == ChatStore.Role.USER }
+                ?.let { handleAppCommand(it.text, allowNoteCreate = false) }
             if (active) {
                 orb.mode = OrbView.Mode.LISTENING
                 statusLabel.text = "LISTENING"
@@ -566,6 +922,8 @@ class MainActivity : Activity() {
 
         override fun onOutputTranscript(text: String) {
             ChatStore.appendModel(text)
+            assistantTurnText.append(text)
+            detectSpokenAction(assistantTurnText.toString())
             if (active) {
                 orb.mode = OrbView.Mode.SPEAKING
                 statusLabel.text = "SPEAKING"
@@ -578,6 +936,7 @@ class MainActivity : Activity() {
         override fun onTurnComplete() {
             ChatStore.assistantDone()
             rememberCompletedSpeech()
+            assistantTurnText.setLength(0)
             orb.setLevel(0f)
             if (active) {
                 if (micMuted) {
@@ -598,6 +957,7 @@ class MainActivity : Activity() {
         override fun onInterrupted() {
             audio?.interrupt()
             ChatStore.interrupted()
+            assistantTurnText.setLength(0)
             if (active) {
                 orb.mode = OrbView.Mode.LISTENING
                 statusLabel.text = "LISTENING"
@@ -624,6 +984,25 @@ class MainActivity : Activity() {
 
         override fun onSessionResumption(handle: String, resumable: Boolean) {
             if (handle.isNotBlank()) JarvisPrefs.sessionHandle = handle
+        }
+
+        override fun onAppCommand(name: String) {
+            Log.d("JarvisDebug", "tool call $name")
+            val action = when (name) {
+                "open_chat" -> AppCommandRouter.Action.OPEN_CHAT
+                "close_chat" -> AppCommandRouter.Action.CLOSE_CHAT
+                "clear_chat" -> AppCommandRouter.Action.CLEAR_CHAT
+                "open_settings" -> AppCommandRouter.Action.OPEN_SETTINGS
+                "open_memory" -> AppCommandRouter.Action.OPEN_MEMORY
+                "open_notes" -> AppCommandRouter.Action.OPEN_NOTES
+                "open_multi_brain" -> AppCommandRouter.Action.OPEN_MULTIBRAIN
+                "change_orb" -> AppCommandRouter.Action.CYCLE_ORB
+                "mute_mic" -> AppCommandRouter.Action.MUTE_MIC
+                "unmute_mic" -> AppCommandRouter.Action.UNMUTE_MIC
+                "go_back" -> AppCommandRouter.Action.BACK
+                else -> return
+            }
+            performAppAction(action)
         }
 
         override fun onClosed(reason: String) {
@@ -659,5 +1038,16 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQUEST_PERMISSIONS = 701
+        private const val APP_CONTROL_INSTRUCTION =
+            "You control this app through the provided functions. You MUST call the matching " +
+                "function when the user asks to: open chat (open_chat), close chat or say back/" +
+                "close/band (close_chat or go_back), delete or clear the transcript (clear_chat), " +
+                "open settings (open_settings), open memory (open_memory), open the notepad or " +
+                "reminders (open_notes), open the multi brain manager (open_multi_brain), change " +
+                "the orb/theme (change_orb), or mute/unmute the microphone (mute_mic/unmute_mic). " +
+                "After a function call keep your reply empty or at most one short sentence. Never " +
+                "repeat a confirmation, never say the same action twice, and do not say 'sir'. " +
+                "Always reply normally to normal conversation and questions. Never claim you " +
+                "cannot control the app."
     }
 }

@@ -5,17 +5,37 @@ import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 object DuckDuckGoSearch {
-    data class Result(val title: String, val snippet: String, val url: String)
+    private const val SCRAPE_RESULTS = 3
+    private const val CONTENT_LIMIT = 2200
+
+    data class Result(
+        val title: String,
+        val snippet: String,
+        val url: String,
+        val content: String = ""
+    )
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
+
+    private val pageClient = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
+
+    private val pageExecutor = Executors.newFixedThreadPool(3)
 
     private val userAgent =
         "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Mobile Safari/537.36"
@@ -33,11 +53,72 @@ object DuckDuckGoSearch {
         } catch (_: Throwable) {
             emptyList()
         }
-        if (htmlResults.isNotEmpty()) return htmlResults
+        val results = if (htmlResults.isNotEmpty()) {
+            htmlResults
+        } else {
+            try {
+                apiSearch(clean, limit)
+            } catch (_: Throwable) {
+                emptyList()
+            }
+        }
+        return enrich(results)
+    }
+
+    private fun enrich(results: List<Result>): List<Result> {
+        if (results.isEmpty()) return results
+        val targets = results.take(SCRAPE_RESULTS)
+        val tasks = targets.map { result ->
+            Callable { result.copy(content = scrapePage(result.url)) }
+        }
         return try {
-            apiSearch(clean, limit)
+            val futures = pageExecutor.invokeAll(tasks, 20, TimeUnit.SECONDS)
+            val enriched = mutableListOf<Result>()
+            futures.forEachIndexed { index, future ->
+                val fallback = targets[index]
+                val item = try {
+                    future.get()
+                } catch (_: Throwable) {
+                    fallback
+                }
+                enriched.add(item)
+            }
+            enriched.addAll(results.drop(SCRAPE_RESULTS))
+            enriched
         } catch (_: Throwable) {
-            emptyList()
+            results
+        }
+    }
+
+    private fun scrapePage(url: String): String {
+        if (url.isBlank() || !url.startsWith("http")) return ""
+        val html = try {
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", userAgent)
+                .header("Accept-Language", "en-US,en;q=0.9,hi;q=0.8")
+                .header("Accept", "text/html,application/xhtml+xml")
+                .get()
+                .build()
+            pageClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) "" else response.body?.string().orEmpty()
+            }
+        } catch (_: Throwable) {
+            ""
+        }
+        if (html.isBlank()) return ""
+        return try {
+            val doc = Jsoup.parse(html, url)
+            doc.select(
+                "script, style, noscript, svg, nav, footer, header, form, iframe, aside, " +
+                    ".ad, .ads, .advert"
+            ).remove()
+            val primary = doc.selectFirst("article, main, [role=main], .article, .post, .entry-content")
+            var text = primary?.text().orEmpty()
+            if (text.length < 300) text = doc.body()?.text().orEmpty()
+            text.replace(Regex("\\s+"), " ").trim().take(CONTENT_LIMIT)
+        } catch (_: Throwable) {
+            ""
         }
     }
 

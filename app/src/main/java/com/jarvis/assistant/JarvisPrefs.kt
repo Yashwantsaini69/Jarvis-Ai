@@ -13,12 +13,9 @@ object JarvisPrefs {
     const val MODEL_38_THINKING = "gemini-3.8-live-extended-thinking"
     const val MODEL_25_LIVE = "gemini-2.5-flash-native-audio-preview-12-2025"
 
-    const val DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+    const val PREFERRED_GROQ_MODEL = "openai/gpt-oss-120b"
     val groqFallbackModels = listOf(
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "llama-3.1-70b-versatile",
-        "openai/gpt-oss-120b",
+        PREFERRED_GROQ_MODEL,
         "openai/gpt-oss-20b"
     )
 
@@ -113,8 +110,20 @@ object JarvisPrefs {
         set(value) = sp.edit().putString("groq_api_key", value.trim()).apply()
 
     var groqModel: String
-        get() = sp.getString("groq_model", DEFAULT_GROQ_MODEL) ?: DEFAULT_GROQ_MODEL
-        set(value) = sp.edit().putString("groq_model", value).apply()
+        get() = sp.getString("groq_model", "").orEmpty()
+        set(value) = sp.edit().putString("groq_model", value.trim()).apply()
+
+    var uncensoredApiKey: String
+        get() = sp.getString("uncensored_api_key", "").orEmpty()
+        set(value) = sp.edit().putString("uncensored_api_key", value.trim()).apply()
+
+    var uncensoredBaseUrl: String
+        get() = sp.getString("uncensored_base_url", "").orEmpty()
+        set(value) = sp.edit().putString("uncensored_base_url", value.trim()).apply()
+
+    var uncensoredModel: String
+        get() = sp.getString("uncensored_model", "").orEmpty()
+        set(value) = sp.edit().putString("uncensored_model", value.trim()).apply()
 
     var deepResearch: Boolean
         get() = sp.getBoolean("deep_research", false)
@@ -128,6 +137,10 @@ object JarvisPrefs {
     var sessionHandle: String
         get() = sp.getString("session_handle", "").orEmpty()
         set(value) = sp.edit().putString("session_handle", value.trim()).apply()
+
+    var lastVersionCode: Int
+        get() = sp.getInt("last_version_code", 0)
+        set(value) = sp.edit().putInt("last_version_code", value).apply()
 
     fun clearSessionHandle() {
         sp.edit().remove("session_handle").apply()

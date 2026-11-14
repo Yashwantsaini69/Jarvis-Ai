@@ -25,7 +25,10 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-class ChatDialog(context: Context) : Dialog(context) {
+class ChatDialog(
+    context: Context,
+    private val onLiveText: ((String) -> Boolean)? = null
+) : Dialog(context) {
     private lateinit var container: LinearLayout
     private lateinit var scroll: ScrollView
     private lateinit var status: TextView
@@ -365,6 +368,11 @@ class ChatDialog(context: Context) : Dialog(context) {
     private fun sendTyped() {
         val text = chatInput.text.toString().trim()
         if (text.isEmpty()) return
+        if (ChatStore.sessionActive && onLiveText?.invoke(text) == true) {
+            chatInput.setText("")
+            autoScroll = true
+            return
+        }
         chatInput.setText("")
         autoScroll = true
         TextChatController.send(context, text) { busy -> setComposerBusy(busy) }

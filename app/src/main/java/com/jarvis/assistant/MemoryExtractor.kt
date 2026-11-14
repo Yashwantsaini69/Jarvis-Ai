@@ -41,9 +41,15 @@ object MemoryExtractor {
             "yaad\\s+se\\s+(?:hatao|mita\\s+do)|delete\\s+karo|hatao)\\s*$"
     )
 
+    private val ADDRESS_PREFIX = Regex(
+        "(?i)^\\s*(?:(?:hey|hi|hello|ok|okay|suno|sun|jarvis|yaar|bro|please|pls)\\b[\\s,;:-]*)+"
+    )
+
     private val REMEMBER = Regex(
-        "(?i)^\\s*(?:please\\s+)?(?:remember(?:\\s+this)?(?:\\s+that)?|note\\s+that|save\\s+this|" +
-            "yaad\\s+rakhna|yaad\\s+rakho|yaad\\s+rakh|dhyaan\\s+rakhna|dhyan\\s+rakhna)" +
+        "(?i)^\\s*(?:please\\s+)?(?:(?:mujhe|muje|mujhko)\\s+)?(?:" +
+            "remember\\s+kar\\s+lo|save\\s+kar\\s+lo|note\\s+kar\\s+lo|" +
+            "remember(?:\\s+this)?(?:\\s+that)?|note\\s+that|note\\s+this|save\\s+this|save\\s+that|" +
+            "yaad\\s+(?:rakhna(?:\\s+hai)?|rakho|rakh|rakh\\s+lo)|dhyaan\\s+rakhna|dhyan\\s+rakhna)" +
             "\\s*(?:ki|that)?\\s*[:,-]?\\s*(.+?)\\s*$"
     )
 
@@ -86,6 +92,10 @@ object MemoryExtractor {
             "(?:kaam|kam)\\s+(?:karta|karti)\\s+(?:hu|hun|hoon)\\b"
     )
 
+    private val WORK_HI2 = Regex(
+        "(?i)\\b(?:mera|meri)\\s+(?:kaam|job|naukri)\\s+([^.,!?;]+?)\\s+(?:mein|me|hai)\\b"
+    )
+
     private val STUDY_EN = Regex(
         "(?i)\\b(?:i\\s+study\\s+at|i'm\\s+studying\\s+at)\\s+([^.,!?;]+)"
     )
@@ -93,6 +103,10 @@ object MemoryExtractor {
     private val STUDY_HI = Regex(
         "(?i)\\b(?:main|mai|mein)\\s+([^.,!?;]+?)\\s+(?:me|mein|mai)\\s+" +
             "(?:padhta|padhti)\\s+(?:hu|hun|hoon)\\b"
+    )
+
+    private val STUDY_HI2 = Regex(
+        "(?i)\\b(?:mera|meri)\\s+(?:padhai|study)\\s+([^.,!?;]+?)\\s+(?:mein|me|hai)\\b"
     )
 
     private val DISLIKE_EN = Regex(
@@ -111,6 +125,16 @@ object MemoryExtractor {
         "(?i)\\bmujhe\\s+([^.,!?;]+?)\\s+(?:bahut\\s+|bohot\\s+)?pasand\\s+(?:hai|h|he)\\b"
     )
 
+    private val FAVORITE_EN = Regex(
+        "(?i)\\b(?:my|mera|meri)\\s+(?:favo(?:u)?rite|pasandida|preferred)\\s+" +
+            "([^.,!?;]{1,80}?)\\s+(?:is|are)\\s+([^.,!?;]{1,80})"
+    )
+
+    private val FAVORITE_HI = Regex(
+        "(?i)\\b(?:mera|meri|my)\\s+(?:favo(?:u)?rite|pasandida)\\s+" +
+            "([^.,!?;]{1,80}?)\\s+([^.,!?;]{1,80}?)\\s+(?:hai|hain|h|he)\\b"
+    )
+
     private val PROJECT_EN = Regex(
         "(?i)\\b(?:i\\s+am\\s+building|i'm\\s+building|i\\s+am\\s+working\\s+on|" +
             "i'm\\s+working\\s+on|my\\s+project\\s+is)\\s+([^.,!?;]+)"
@@ -123,6 +147,44 @@ object MemoryExtractor {
 
     private val PROJECT_HI2 = Regex(
         "(?i)\\bmera\\s+project\\s+(.+?)\\s+(?:hai|h|he)\\b"
+    )
+
+    private val ASPIRANT_EN = Regex(
+        "(?i)\\b(?:i\\s+am|i'm)\\s+(?:an?\\s+)?([^.,!?;]{1,60}?)\\s+aspirant\\b"
+    )
+
+    private val PREPARING_EN = Regex(
+        "(?i)\\b(?:i\\s+am|i'm)\\s+(?:currently\\s+)?prepar(?:ing|e)\\s+for\\s+([^.,!?;]{2,80})"
+    )
+
+    private val GOAL_EN = Regex(
+        "(?i)\\b(?:my|mera|meri)\\s+(?:goal|aim|dream|target|laksya|lakshya)\\s+" +
+            "(?:is|hai|h)\\s+(?:to\\s+)?([^.,!?;]{2,100})"
+    )
+
+    private val BECOME_EN = Regex(
+        "(?i)\\b(?:i\\s+want\\s+to\\s+(?:become|be)|i\\s+wish\\s+to\\s+become)\\s+" +
+            "([^.,!?;]{2,80})"
+    )
+
+    private val ASPIRANT_HI = Regex(
+        "(?i)\\b(?:main|mai|mein)\\s+(?:ek\\s+)?([^.,!?;]{1,60}?)\\s+" +
+            "aspirant\\s+(?:hu|hun|hoon|h)\\b"
+    )
+
+    private val PREPARING_HI = Regex(
+        "(?i)\\b(?:main|mai|mein)\\s+([^.,!?;]{1,80}?)\\s+(?:ki\\s+)?" +
+            "(?:taiyari|tyari|preparation)\\s+" +
+            "(?:kar\\s+raha|kar\\s+rahi|karta|karti)\\s+(?:hu|hun|hoon|h)\\b"
+    )
+
+    private val GOAL_HI = Regex(
+        "(?i)\\bmera\\s+(?:goal|aim|dream|target|laksya|lakshya)\\s+" +
+            "([^.,!?;]{2,100}?)\\s+(?:hai|h)\\b"
+    )
+
+    private val BECOME_HI = Regex(
+        "(?i)\\b(?:mujhe|muje)\\s+([^.,!?;]{2,80}?)\\s+banna\\s+(?:hai|h)\\b"
     )
 
     private val HEDGES = Regex(
@@ -179,7 +241,8 @@ object MemoryExtractor {
             return commands
         }
 
-        for (sentence in splitSentences(text)) {
+        for (rawSentence in splitSentences(text)) {
+            val sentence = stripAddress(rawSentence)
             if (sentence.length < 3) continue
             if (isSensitive(sentence)) continue
 
@@ -278,6 +341,19 @@ object MemoryExtractor {
             )
         }
 
+        fun addFavorite(regex: Regex) {
+            val match = regex.find(text) ?: return
+            val thing = cleanValue(match.groupValues.getOrNull(1).orEmpty())
+            val value = cleanValue(match.groupValues.getOrNull(2).orEmpty())
+            if (thing.length < 2 || thing.length > 80 || value.length < 2 || value.length > 160) return
+            if (isSensitiveValue(value)) return
+            out.add(
+                Command.Save(
+                    MemoryEntry("preference", "like:" + slotFor(thing), value, forcedImportance ?: 4, confidence)
+                )
+            )
+        }
+
         fun addProject(raw: String?) {
             if (raw == null) return
             val value = cleanValue(raw)
@@ -286,6 +362,22 @@ object MemoryExtractor {
             out.add(
                 Command.Save(
                     MemoryEntry("project", "project:" + slotFor(value), value, forcedImportance ?: 4, confidence)
+                )
+            )
+        }
+
+        fun addGoal(raw: String?, suffix: String = "") {
+            if (raw == null) return
+            val base = cleanValue(raw)
+                .replace(Regex("(?i)^(?:an?|the)\\s+"), "")
+                .trim()
+            if (base.length < 2) return
+            val value = (base + if (suffix.isNotBlank()) " $suffix" else "").trim()
+            if (value.length > 160) return
+            if (isSensitiveValue(value)) return
+            out.add(
+                Command.Save(
+                    MemoryEntry("goal", "goal:" + slotFor(value), value, forcedImportance ?: 4, confidence)
                 )
             )
         }
@@ -299,17 +391,31 @@ object MemoryExtractor {
         add("identity", "birthday", capture(text, BIRTHDAY), 5)
         add("work", "employer", capture(text, WORK_EN), 4)
         add("work", "employer", capture(text, WORK_HI), 4)
+        add("work", "employer", capture(text, WORK_HI2), 4)
         add("education", "school", capture(text, STUDY_EN), 4)
         add("education", "school", capture(text, STUDY_HI), 4)
+        add("education", "school", capture(text, STUDY_HI2), 4)
 
         addPreference("dislike:", capture(text, DISLIKE_EN))
         addPreference("dislike:", capture(text, DISLIKE_HI))
         addPreference("like:", capture(text, LIKE_EN))
         addPreference("like:", capture(text, LIKE_HI))
 
+        addFavorite(FAVORITE_EN)
+        addFavorite(FAVORITE_HI)
+
         addProject(capture(text, PROJECT_EN))
         addProject(capture(text, PROJECT_HI))
         addProject(capture(text, PROJECT_HI2))
+
+        addGoal(capture(text, ASPIRANT_EN), "aspirant")
+        addGoal(capture(text, ASPIRANT_HI), "aspirant")
+        addGoal(capture(text, PREPARING_EN))
+        addGoal(capture(text, PREPARING_HI))
+        addGoal(capture(text, GOAL_EN))
+        addGoal(capture(text, GOAL_HI))
+        addGoal(capture(text, BECOME_EN))
+        addGoal(capture(text, BECOME_HI))
 
         return out
     }
@@ -323,6 +429,9 @@ object MemoryExtractor {
         FORGET_HI_TRAILING.find(sentence)?.let { return it.groupValues.getOrNull(1)?.trim() }
         return null
     }
+
+    private fun stripAddress(value: String): String =
+        ADDRESS_PREFIX.replace(value, "").trim()
 
     private fun splitSentences(text: String): List<String> {
         val out = mutableListOf<String>()
