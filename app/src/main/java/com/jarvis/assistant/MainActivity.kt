@@ -684,6 +684,11 @@ class MainActivity : Activity() {
         return true
     }
 
+    private fun currentUserText(): String? =
+        ChatStore.latest()
+            ?.takeIf { it.role == ChatStore.Role.USER && it.text.isNotBlank() }
+            ?.text
+
     private fun scheduleVoiceReminder(text: String) {
         if (!VoiceReminderParser.hasTrigger(text)) return
         pendingReminderText = text
@@ -920,6 +925,8 @@ class MainActivity : Activity() {
                     it.role == ChatStore.Role.USER && it.final && it.text.isNotBlank()
                 }
                 if (last != null) handleAppCommand(last.text)
+            } else if (text.isNotBlank()) {
+                currentUserText()?.let { scheduleVoiceReminder(it) }
             }
             if (active) {
                 orb.mode = OrbView.Mode.LISTENING
@@ -936,7 +943,7 @@ class MainActivity : Activity() {
             ChatStore.latest()
                 ?.takeIf { it.role == ChatStore.Role.USER }
                 ?.let { handleAppCommand(it.text, allowNoteCreate = false) }
-            scheduleVoiceReminder(text)
+            currentUserText()?.let { scheduleVoiceReminder(it) }
             if (active) {
                 orb.mode = OrbView.Mode.LISTENING
                 statusLabel.text = "LISTENING"
