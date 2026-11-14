@@ -12,14 +12,17 @@ object VoiceReminderParser {
 
     private val triggerWords = setOf(
         "reminder", "reminders", "remind", "alarm", "alert",
-        "रिमाइंडर", "अलार्म", "एलर्ट"
+        "wake", "wakeup", "uthana", "uthna", "jagana", "jagna", "jaga",
+        "रिमाइंडर", "अलार्म", "एलर्ट", "उठाना", "उठना", "जगाना"
     )
 
     private val clockWords = setOf("baje", "baj", "oclock", "o'clock", "बजे")
 
     private val meridianWords = setOf("am", "pm")
 
-    private val afterWords = setOf("baad", "bad", "after", "बाद")
+    private val afterWords = setOf(
+        "baad", "bad", "after", "in", "me", "बाद", "में", "मे"
+    )
 
     private val dateTomorrowWords = setOf("kal", "tomorrow", "कल")
     private val dateTodayWords = setOf("aaj", "today", "आज")
@@ -42,7 +45,8 @@ object VoiceReminderParser {
         "lagana", "lagado", "laga", "lag", "kar", "karo", "kardo", "do", "de",
         "dijiye", "mujhe", "muje", "mera", "meri", "ka", "ke", "ki", "liye", "liy",
         "pe", "par", "ko", "se", "tak", "time", "dena", "deni", "dunga", "dungi",
-        "denge", "dilana", "yaad", "dila", "dilao", "dilado",
+        "denge", "dilana", "yaad", "dila", "dilao", "dilado", "in", "up",
+        "hai", "है",
         "remind", "मुझे", "मेरा", "मेरी", "का", "के", "की", "लिए", "याद", "दिला",
         "दिलाओ", "लगाओ", "करो", "कर", "दो", "सेट", "पे", "पर", "को", "से", "तक",
         "समय", "देना", "दूंगा", "दूंगी"
@@ -138,6 +142,13 @@ object VoiceReminderParser {
             if (number <= 0) continue
             val unit = unitSeconds[tokens[i + 2]] ?: continue
             used.addAll(listOf(i, i + 1, i + 2))
+            return now + number * unit * 1000L
+        }
+        for (i in 0 until tokens.size - 1) {
+            val number = tokens[i].toIntOrNull() ?: continue
+            if (number <= 0) continue
+            val unit = unitSeconds[tokens[i + 1]] ?: continue
+            used.addAll(listOf(i, i + 1))
             return now + number * unit * 1000L
         }
         return null

@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.text.TextUtils
 import android.util.Log
@@ -51,8 +53,15 @@ class MainActivity : Activity() {
     private var lastActionAt = 0L
     private var lastNoteSignature = ""
     private var lastNoteAt = 0L
-    private var lastReminderSignature = ""
+    private var lastReminderScheduledAt = 0L
     private var lastReminderAt = 0L
+    private val reminderHandler = Handler(Looper.getMainLooper())
+    private var pendingReminderText = ""
+    private val parsePendingReminder = Runnable {
+        val text = pendingReminderText
+        pendingReminderText = ""
+        if (text.isNotBlank()) handleVoiceReminder(text)
+    }
     private val assistantTurnText = StringBuilder()
     private var connectionWatchdog: Runnable? = null
     private var updatePromptVisible = false
@@ -113,6 +122,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         ReminderBus.removeListener(reminderListener)
+        reminderHandler.removeCallbacks(parsePendingReminder)
+        pendingReminderText = ""
         if (client != null || audio != null) {
             stopRequested = true
             releaseSession()
@@ -388,6 +399,8 @@ class MainActivity : Activity() {
     }
 
     private fun releaseSession() {
+        reminderHandler.removeCallbacks(parsePendingReminder)
+        pendingReminderText = ""
         connectionWatchdog?.let { orb.removeCallbacks(it) }
         connectionWatchdog = null
         val currentClient = client
@@ -660,6 +673,10 @@ class MainActivity : Activity() {
     private fun handleAppCommand(raw: String, allowNoteCreate: Boolean = true): Boolean {
         if (allowNoteCreate && handleVoiceReminder(raw)) return true
         if (allowNoteCreate && handleNoteCreation(raw)) return true
+        if (allowNoteCreate && VoiceReminderParser.hasTrigger(raw)) {
+            openNotes()
+            return true
+        }
         val action = AppCommandRouter.parse(raw)
         Log.d("JarvisDebug", "parse '$raw' -> ${action?.name ?: "none"}")
         if (action == null) return false
@@ -667,14 +684,20 @@ class MainActivity : Activity() {
         return true
     }
 
+    private fun scheduleVoiceReminder(text: String) {
+        if (!VoiceReminderParser.hasTrigger(text)) return
+        pendingReminderText = text
+        reminderHandler.removeCallbacks(parsePendingReminder)
+        reminderHandler.postDelayed(parsePendingReminder, 1200L)
+    }
+
     private fun handleVoiceReminder(raw: String): Boolean {
         val parsed = VoiceReminderParser.parse(raw) ?: return false
-        val signature = parsed.title + "|" + parsed.atMillis
         val now = SystemClock.elapsedRealtime()
-        if (signature == lastReminderSignature && now - lastReminderAt < 8000L) return true
+        if (parsed.atMillis == lastReminderScheduledAt && now - lastReminderAt < 8000L) return true
         val id = NoteStore.add(parsed.title, parsed.body, parsed.atMillis)
         if (id <= 0L) return false
-        lastReminderSignature = signature
+        lastReminderScheduledAt = parsed.atMillis
         lastReminderAt = now
         NoteStore.get(id)?.let { ReminderScheduler.schedule(applicationContext, it) }
         val formatted = SimpleDateFormat("dd MMM, h:mm a", Locale.getDefault())
@@ -890,6 +913,8 @@ class MainActivity : Activity() {
             Log.d("JarvisDebug", "input final=$finished text=$text")
             ChatStore.appendUserFinal(text, finished)
             if (finished) {
+                reminderHandler.removeCallbacks(parsePendingReminder)
+                pendingReminderText = ""
                 rememberCompletedSpeech()
                 val last = ChatStore.snapshot().lastOrNull {
                     it.role == ChatStore.Role.USER && it.final && it.text.isNotBlank()
@@ -911,6 +936,7 @@ class MainActivity : Activity() {
             ChatStore.latest()
                 ?.takeIf { it.role == ChatStore.Role.USER }
                 ?.let { handleAppCommand(it.text, allowNoteCreate = false) }
+            scheduleVoiceReminder(text)
             if (active) {
                 orb.mode = OrbView.Mode.LISTENING
                 statusLabel.text = "LISTENING"
