@@ -55,12 +55,21 @@ class MainActivity : Activity() {
     private var lastNoteAt = 0L
     private var lastReminderScheduledAt = 0L
     private var lastReminderAt = 0L
+    private var lastReminderAckAt = 0L
+    private var lastReminderIntentAt = 0L
+    private var lastReminderNoteId = 0L
+    private var pendingConfirmNoteId = 0L
     private val reminderHandler = Handler(Looper.getMainLooper())
     private var pendingReminderText = ""
     private val parsePendingReminder = Runnable {
         val text = pendingReminderText
         pendingReminderText = ""
         if (text.isNotBlank()) handleVoiceReminder(text)
+    }
+    private val confirmReminderRunnable = Runnable {
+        val id = pendingConfirmNoteId
+        pendingConfirmNoteId = 0L
+        if (id > 0L) sendReminderConfirmation(id)
     }
     private val assistantTurnText = StringBuilder()
     private var connectionWatchdog: Runnable? = null
@@ -123,7 +132,9 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         ReminderBus.removeListener(reminderListener)
         reminderHandler.removeCallbacks(parsePendingReminder)
+        reminderHandler.removeCallbacks(confirmReminderRunnable)
         pendingReminderText = ""
+        pendingConfirmNoteId = 0L
         if (client != null || audio != null) {
             stopRequested = true
             releaseSession()
@@ -400,7 +411,9 @@ class MainActivity : Activity() {
 
     private fun releaseSession() {
         reminderHandler.removeCallbacks(parsePendingReminder)
+        reminderHandler.removeCallbacks(confirmReminderRunnable)
         pendingReminderText = ""
+        pendingConfirmNoteId = 0L
         connectionWatchdog?.let { orb.removeCallbacks(it) }
         connectionWatchdog = null
         val currentClient = client
@@ -514,6 +527,10 @@ class MainActivity : Activity() {
     private fun performAppAction(action: AppCommandRouter.Action) {
         Log.d("JarvisDebug", "perform action ${action.name}")
         val now = SystemClock.elapsedRealtime()
+        if (action == AppCommandRouter.Action.OPEN_NOTES && now - lastReminderIntentAt < 8_000L) {
+            Log.d("JarvisDebug", "ignoring open_notes during reminder flow")
+            return
+        }
         if (action.name == lastActionName && now - lastActionAt < 1800L) return
         lastActionName = action.name
         lastActionAt = now
@@ -626,7 +643,6 @@ class MainActivity : Activity() {
 
         val isChat = has("chat", "transcript", "चैट")
         val isMemory = has("memory", "मेमोरी")
-        val isNotes = has("note", "notepad", "नोट")
         val isSettings = has("settings", "setting", "सेटिंग")
         val isMulti = has("multi brain", "multibrain", "brain manager")
         val isMic = has("mic", "microphone", "माइक")
@@ -637,10 +653,6 @@ class MainActivity : Activity() {
         }
         if (isMemory && has(*openConfirm)) {
             performAppAction(AppCommandRouter.Action.OPEN_MEMORY)
-            return
-        }
-        if (isNotes && has(*openConfirm)) {
-            performAppAction(AppCommandRouter.Action.OPEN_NOTES)
             return
         }
         if (isSettings && has(*openConfirm)) {
@@ -671,10 +683,11 @@ class MainActivity : Activity() {
     }
 
     private fun handleAppCommand(raw: String, allowNoteCreate: Boolean = true): Boolean {
+        if (allowNoteCreate && handleReminderQuery(raw)) return true
         if (allowNoteCreate && handleVoiceReminder(raw)) return true
         if (allowNoteCreate && handleNoteCreation(raw)) return true
-        if (allowNoteCreate && VoiceReminderParser.hasTrigger(raw)) {
-            openNotes()
+        if (VoiceReminderParser.hasTrigger(raw) && !isExplicitNotesOpen(raw)) {
+            if (allowNoteCreate) askForReminderTime()
             return true
         }
         val action = AppCommandRouter.parse(raw)
@@ -691,25 +704,187 @@ class MainActivity : Activity() {
 
     private fun scheduleVoiceReminder(text: String) {
         if (!VoiceReminderParser.hasTrigger(text)) return
+        lastReminderIntentAt = SystemClock.elapsedRealtime()
+        if (VoiceReminderParser.parse(text) != null) acknowledgeReminderCommand()
         pendingReminderText = text
         reminderHandler.removeCallbacks(parsePendingReminder)
         reminderHandler.postDelayed(parsePendingReminder, 1200L)
     }
 
+    private fun acknowledgeReminderCommand() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastReminderAckAt < 10_000L) return
+        val live = client ?: return
+        if (!active) return
+        lastReminderAckAt = now
+        live.sendText(
+            "[SYSTEM] The app is setting the reminder automatically in the background. " +
+                "Say exactly one short sentence: \"Ok, reminder set ho raha hai.\" " +
+                "Do not say you opened any page. Do not ask the user to set it."
+        )
+    }
+
     private fun handleVoiceReminder(raw: String): Boolean {
         val parsed = VoiceReminderParser.parse(raw) ?: return false
+        acknowledgeReminderCommand()
         val now = SystemClock.elapsedRealtime()
-        if (parsed.atMillis == lastReminderScheduledAt && now - lastReminderAt < 8000L) return true
-        val id = NoteStore.add(parsed.title, parsed.body, parsed.atMillis)
-        if (id <= 0L) return false
+        lastReminderIntentAt = now
+        val sameSlot = parsed.atMillis == lastReminderScheduledAt &&
+            now - lastReminderAt < 8000L
+        var id = if (sameSlot) lastReminderNoteId else 0L
+        var changed = false
+        if (id > 0L) {
+            val existing = NoteStore.get(id)
+            if (existing == null) {
+                id = 0L
+            } else {
+                val oldDetails = noteDetails(existing)
+                val newDetails = parsedDetails(parsed)
+                if (newDetails.isNotBlank() && newDetails != oldDetails) {
+                    NoteStore.update(id, parsed.title, parsed.body, parsed.atMillis)
+                    changed = true
+                }
+            }
+        }
+        if (id <= 0L) {
+            id = NoteStore.add(parsed.title, parsed.body, parsed.atMillis)
+            if (id <= 0L) return false
+            lastReminderNoteId = id
+            changed = true
+        }
         lastReminderScheduledAt = parsed.atMillis
         lastReminderAt = now
         NoteStore.get(id)?.let { ReminderScheduler.schedule(applicationContext, it) }
-        val formatted = SimpleDateFormat("dd MMM, h:mm a", Locale.getDefault())
-            .format(Date(parsed.atMillis))
-        toast("Reminder set for $formatted")
-        openNotes()
+        if (changed) {
+            pendingConfirmNoteId = id
+            reminderHandler.removeCallbacks(confirmReminderRunnable)
+            reminderHandler.postDelayed(confirmReminderRunnable, 1200L)
+        }
         return true
+    }
+
+    private fun parsedDetails(parsed: VoiceReminderParser.Parsed): String {
+        val title = parsed.title.trim()
+        return when {
+            title.isNotBlank() && !title.equals("Reminder", ignoreCase = true) -> title
+            parsed.body.trim().isNotBlank() -> parsed.body.trim()
+            else -> ""
+        }
+    }
+
+    private fun noteDetails(note: NoteStore.Note): String {
+        val title = note.title.trim()
+        return when {
+            title.isNotBlank() && !title.equals("Reminder", ignoreCase = true) -> title
+            note.body.trim().isNotBlank() -> note.body.trim()
+            else -> ""
+        }
+    }
+
+    private fun sendReminderConfirmation(noteId: Long) {
+        val note = NoteStore.get(noteId) ?: return
+        val formatted = SimpleDateFormat("dd MMM, h:mm a", Locale.getDefault())
+            .format(Date(note.remindAt))
+        val details = noteDetails(note).replace('"', '\'')
+        val confirmation = if (details.isBlank()) {
+            "Ho gaya, reminder set hai — $formatted."
+        } else {
+            "Ho gaya, reminder set hai — $details, $formatted."
+        }
+        val live = client
+        if (live != null && active) {
+            live.sendText(
+                "[SYSTEM] The reminder is now successfully set for $formatted. " +
+                    "Say exactly one short sentence in the user's language: " +
+                    "\"$confirmation\" " +
+                    "Do not say you opened any page. Do not ask the user to set it."
+            )
+        } else {
+            toast("Reminder set for $formatted")
+        }
+    }
+
+    private fun handleReminderQuery(raw: String): Boolean {
+        if (!isReminderListQuery(raw)) return false
+        lastReminderIntentAt = SystemClock.elapsedRealtime()
+        val notes = NoteStore.upcoming()
+        val text = reminderListText(notes)
+        val live = client
+        if (live != null && active) {
+            live.sendText(
+                "[SYSTEM] The user asked what reminders are set. Say exactly this in the user's " +
+                    "language, without adding anything: \"$text\""
+            )
+        } else {
+            toast(text)
+        }
+        return true
+    }
+
+    private fun isExplicitNotesOpen(raw: String): Boolean {
+        val t = raw.lowercase()
+        if (!t.contains("note") && !t.contains("notepad") &&
+            !t.contains("reminder") && !t.contains("रिमाइंडर") && !t.contains("नोट")
+        ) return false
+        val words = t.split(Regex("[^\\p{L}\\p{M}\\p{N}]+"))
+            .filter { it.isNotEmpty() }
+            .toSet()
+        val create = setOf(
+            "set", "lagao", "laga", "lagana", "banao", "bana", "add", "save",
+            "create", "likho", "likh", "likhna", "likhdo", "rakho",
+            "सेट", "लगाओ", "बनाओ", "लिखो", "रखो"
+        )
+        if (words.any { it in create }) return false
+        val open = setOf(
+            "kholo", "khol", "kholna", "kholiye", "open", "show", "dikhao",
+            "dikha", "chalu", "start", "on", "खोलो", "खोल", "दिखाओ", "चालू",
+            "शुरू", "ऑन"
+        )
+        return words.any { it in open }
+    }
+
+    private fun isReminderListQuery(raw: String): Boolean {
+        val t = raw.lowercase()
+        if (!t.contains("reminder") && !t.contains("रिमाइंडर")) return false
+        val cues = listOf(
+            "kya", "kaunse", "kaun kaun", "konsa", "konsi", "kitne",
+            "reminder list", "list batao", "list sunao", "list dikhao", "list show",
+            "batao", "bata do", "bata de", "bataiye", "sunao", "dikhao", "dikha do",
+            "reminder read", "reminder padho", "reminder padh", "reminder bolo",
+            "reminder show", "reminder check", "read out", "read my", "my reminders",
+            "what reminders", "which reminders", "tell me", "show me", "show all",
+            "pending", "upcoming", "set hai", "set h", "set hain", "set he",
+            "sete hain", "set hua", "set hue", "क्या", "कौन", "कौनसे", "कितने",
+            "बताओ", "सुनाओ", "लिस्ट", "दिखाओ"
+        )
+        return cues.any { t.contains(it) }
+    }
+
+    private fun reminderListText(notes: List<NoteStore.Note>): String {
+        if (notes.isEmpty()) return "Abhi koi reminder set nahi hai."
+        val format = SimpleDateFormat("dd MMM, h:mm a", Locale.getDefault())
+        val items = notes.mapIndexed { index, note ->
+            val details = note.title.trim()
+                .ifBlank { note.body.trim() }
+                .ifBlank { "Reminder" }
+            "${index + 1}. $details, ${format.format(Date(note.remindAt))}"
+        }
+        return "Total ${notes.size} reminder set hain: " + items.joinToString("; ")
+    }
+
+    private fun askForReminderTime() {
+        lastReminderIntentAt = SystemClock.elapsedRealtime()
+        val live = client
+        if (live != null && active) {
+            live.sendText(
+                "[SYSTEM] The user's reminder phrase did not include a clear time. " +
+                    "Ask one short question in the user's language: " +
+                    "\"Reminder kis time ka set karna hai?\" " +
+                    "Do not open any page. Do not say it is already set."
+            )
+        } else {
+            toast("Reminder kis time ka set karna hai?")
+        }
     }
 
     private fun announceReminder(note: NoteStore.Note) {
@@ -1084,12 +1259,18 @@ class MainActivity : Activity() {
             "You control this app through the provided functions. You MUST call the matching " +
                 "function when the user asks to: open chat (open_chat), close chat or say back/" +
                 "close/band (close_chat or go_back), delete or clear the transcript (clear_chat), " +
-                "open settings (open_settings), open memory (open_memory), open the notepad or " +
-                "reminders (open_notes), open the multi brain manager (open_multi_brain), change " +
+                "open settings (open_settings), open memory (open_memory), " +
+                "open the multi brain manager (open_multi_brain), change " +
                 "the orb/theme (change_orb), or mute/unmute the microphone (mute_mic/unmute_mic). " +
                 "After a function call keep your reply empty or at most one short sentence. Never " +
                 "repeat a confirmation, never say the same action twice, and do not say 'sir'. " +
                 "Always reply normally to normal conversation and questions. Never claim you " +
-                "cannot control the app."
+                "cannot control the app. REMINDERS: the app creates reminders silently in the " +
+                "background. Never open the notepad or any page to create a reminder. Never tell " +
+                "the user to set a reminder themselves and never say you opened a page. When the " +
+                "user asks to set a reminder, say only 'Ok, reminder set ho raha hai.' and wait; " +
+                "the app will send a [SYSTEM] confirmation. When you receive a [SYSTEM] reminder " +
+                "confirmation or a reminder list, repeat it exactly. When the user asks what " +
+                "reminders are set, read the provided list."
     }
 }

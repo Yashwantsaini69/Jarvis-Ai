@@ -187,7 +187,6 @@ class GeminiLiveClient(
         put(appFunction("close_chat", "Close the in-app chat/transcript screen. Call this when the user asks to close, hide or stop chat or transcript."))
         put(appFunction("open_settings", "Open the app Settings screen. Call this when the user asks to open settings, configuration or preferences."))
         put(appFunction("open_memory", "Open the memory manager showing everything saved about the user. Call this when the user asks to open or manage memory."))
-        put(appFunction("open_notes", "Open the user's notepad with saved notes and reminders. Call this when the user asks to open notes, notepad or reminders."))
         put(appFunction("mute_mic", "Mute the microphone. Call this when the user asks to mute the mic, turn the mic off, or stop listening."))
         put(appFunction("unmute_mic", "Unmute the microphone. Call this when the user asks to unmute the mic or turn the mic on."))
         put(appFunction("clear_chat", "Delete the saved live chat transcript history. Call this when the user asks to clear, delete or wipe the transcript or chat history."))
@@ -204,7 +203,6 @@ class GeminiLiveClient(
         name == "clear_chat" ||
         name == "open_settings" ||
         name == "open_memory" ||
-        name == "open_notes" ||
         name == "open_multi_brain" ||
         name == "change_orb" ||
         name == "mute_mic" ||
