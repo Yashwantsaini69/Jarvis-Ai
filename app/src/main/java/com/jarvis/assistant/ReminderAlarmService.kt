@@ -19,6 +19,8 @@ class ReminderAlarmService : Service() {
     private var player: MediaPlayer? = null
     private var vibrator: Vibrator? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var currentNote: NoteStore.Note? = null
+    private var manualStop = false
     private val handler = Handler(Looper.getMainLooper())
     private val stopRunnable = Runnable { stopSelf() }
 
@@ -26,6 +28,7 @@ class ReminderAlarmService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            manualStop = true
             stopSelf()
             return START_NOT_STICKY
         }
@@ -40,12 +43,22 @@ class ReminderAlarmService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        currentNote = note
         acquireWakeLock()
         ReminderNotifier.ensureChannels(this)
-        startForeground(
-            ReminderNotifier.notificationId(note.id),
-            ReminderNotifier.build(this, note, ReminderNotifier.SILENT_CHANNEL_ID, true)
-        )
+        try {
+            startForeground(
+                ReminderNotifier.notificationId(note.id),
+                ReminderNotifier.build(this, note, ReminderNotifier.SILENT_CHANNEL_ID, true)
+            )
+        } catch (_: Throwable) {
+            ReminderNotifier.show(this, note)
+            playAlarm()
+            startVibration()
+            handler.removeCallbacks(stopRunnable)
+            handler.postDelayed(stopRunnable, 15_000L)
+            return START_NOT_STICKY
+        }
         playAlarm()
         startVibration()
         handler.removeCallbacks(stopRunnable)
@@ -155,6 +168,13 @@ class ReminderAlarmService : Service() {
         } else {
             @Suppress("DEPRECATION")
             stopForeground(true)
+        }
+        val note = currentNote
+        if (!manualStop && note != null) {
+            try {
+                ReminderNotifier.showSilent(this, note)
+            } catch (_: Throwable) {
+            }
         }
         super.onDestroy()
     }

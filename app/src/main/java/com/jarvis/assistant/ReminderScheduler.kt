@@ -212,4 +212,13 @@ object ReminderNotifier {
         } catch (_: Throwable) {
         }
     }
+
+    fun showSilent(context: Context, note: NoteStore.Note) {
+        ensureChannels(context)
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        try {
+            manager.notify(notificationId(note.id), build(context, note, SILENT_CHANNEL_ID, false))
+        } catch (_: Throwable) {
+        }
+    }
 }
