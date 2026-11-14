@@ -8,10 +8,8 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
-import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
-import android.provider.Settings
 
 object ReminderScheduler {
 
@@ -82,13 +80,14 @@ object ReminderScheduler {
 }
 
 object ReminderNotifier {
-    private const val CHANNEL_ID = "jarvis_reminders_alarm_v2"
+    private const val CHANNEL_ID = "jarvis_reminders_alarm_v3"
+    private const val OLD_CHANNEL_ID = "jarvis_reminders_alarm_v2"
     private const val NOTIFICATION_BASE = 5400
 
     fun ensureChannel(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
-        val sound = alarmSound()
+        val sound = alarmSound(context)
         val attributes = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_ALARM)
             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
@@ -106,15 +105,11 @@ object ReminderNotifier {
             lockscreenVisibility = Notification.VISIBILITY_PUBLIC
         }
         manager.createNotificationChannel(channel)
+        manager.deleteNotificationChannel(OLD_CHANNEL_ID)
     }
 
-    private fun alarmSound(): Uri {
-        val alarm = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-        if (alarm != null) return alarm
-        val notification = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-        if (notification != null) return notification
-        return Settings.System.DEFAULT_NOTIFICATION_URI
-    }
+    private fun alarmSound(context: Context): Uri =
+        Uri.parse("android.resource://${context.packageName}/${R.raw.reminder_alarm}")
 
     fun show(context: Context, note: NoteStore.Note) {
         ensureChannel(context)
@@ -136,13 +131,17 @@ object ReminderNotifier {
             "Reminder: $heading"
         }
         val body = note.body.ifBlank { "It's time for $heading" }
+        val sound = alarmSound(context)
+        val attributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ALARM)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(context, CHANNEL_ID)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(context)
-                .setSound(alarmSound())
-                .setDefaults(Notification.DEFAULT_ALL)
+                .setSound(sound)
                 .setVibrate(longArrayOf(0L, 700L, 350L, 700L))
         }
         builder
@@ -157,6 +156,7 @@ object ReminderNotifier {
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setWhen(note.remindAt)
             .setShowWhen(true)
+            .setSound(sound, attributes)
         try {
             manager.notify(NOTIFICATION_BASE + note.id.toInt(), builder.build())
         } catch (_: Throwable) {
