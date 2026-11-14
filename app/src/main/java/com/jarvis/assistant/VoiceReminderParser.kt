@@ -24,9 +24,33 @@ object VoiceReminderParser {
         "baad", "bad", "after", "in", "me", "बाद", "में", "मे"
     )
 
-    private val dateTomorrowWords = setOf("kal", "tomorrow", "कल")
+    private val dateTomorrowWords = setOf(
+        "kal", "tomorrow", "tommorow", "tomorow", "tmrw", "2moro", "कल"
+    )
     private val dateTodayWords = setOf("aaj", "today", "आज")
     private val dateParsoWords = setOf("parso", "parson", "परसों")
+
+    private val monthWords: Map<String, Int> = mapOf(
+        "jan" to Calendar.JANUARY, "january" to Calendar.JANUARY,
+        "feb" to Calendar.FEBRUARY, "february" to Calendar.FEBRUARY,
+        "mar" to Calendar.MARCH, "march" to Calendar.MARCH,
+        "apr" to Calendar.APRIL, "april" to Calendar.APRIL,
+        "may" to Calendar.MAY,
+        "jun" to Calendar.JUNE, "june" to Calendar.JUNE,
+        "jul" to Calendar.JULY, "july" to Calendar.JULY,
+        "aug" to Calendar.AUGUST, "august" to Calendar.AUGUST,
+        "sep" to Calendar.SEPTEMBER, "sept" to Calendar.SEPTEMBER,
+        "september" to Calendar.SEPTEMBER,
+        "oct" to Calendar.OCTOBER, "october" to Calendar.OCTOBER,
+        "nov" to Calendar.NOVEMBER, "november" to Calendar.NOVEMBER,
+        "dec" to Calendar.DECEMBER, "december" to Calendar.DECEMBER,
+        "जनवरी" to Calendar.JANUARY, "फरवरी" to Calendar.FEBRUARY,
+        "मार्च" to Calendar.MARCH, "अप्रैल" to Calendar.APRIL,
+        "मई" to Calendar.MAY, "जून" to Calendar.JUNE, "जुलाई" to Calendar.JULY,
+        "अगस्त" to Calendar.AUGUST, "सितंबर" to Calendar.SEPTEMBER,
+        "अक्टूबर" to Calendar.OCTOBER, "नवंबर" to Calendar.NOVEMBER,
+        "दिसंबर" to Calendar.DECEMBER
+    )
 
     private val morningWords = setOf("subah", "morning", "सुबह")
     private val afternoonWords = setOf("dopahar", "afternoon", "दोपहर")
@@ -43,7 +67,8 @@ object VoiceReminderParser {
     private val fillerWords = setOf(
         "please", "pls", "plz", "me", "to", "at", "on", "for", "set", "lagao",
         "lagana", "lagado", "laga", "lag", "kar", "karo", "kardo", "do", "de",
-        "dijiye", "mujhe", "muje", "mera", "meri", "ka", "ke", "ki", "liye", "liy",
+        "dijiye", "mujhe", "muje", "mereko", "merko", "meko", "mera", "meri",
+        "ka", "ke", "ki", "liye", "liy", "of",
         "pe", "par", "ko", "se", "tak", "time", "dena", "deni", "dunga", "dungi",
         "denge", "dilana", "yaad", "dila", "dilao", "dilado", "in", "up",
         "hai", "है",
@@ -79,6 +104,7 @@ object VoiceReminderParser {
                 token !in eveningWords &&
                 token !in nightWords &&
                 token !in fillerWords &&
+                token !in monthWords.keys &&
                 token !in unitSeconds.keys
         }
         val title = content.joinToString(" ").trim().ifEmpty { "Reminder" }
@@ -90,8 +116,11 @@ object VoiceReminderParser {
 
     private fun tokenize(raw: String): List<String> {
         return raw.lowercase()
+            .replace(Regex("(\\d+)(st|nd|rd|th)\\b"), "$1")
+            .replace(Regex("(\\d):(\\d{2})(am|pm)\\b"), "$1:$2 $3")
             .replace(Regex("(\\d)(am|pm)\\b"), "$1 $2")
-            .replace(Regex("[^\\p{L}\\p{M}\\p{N}:]+"), " ")
+            .replace(Regex("(\\d)[.](\\d{2})\\b"), "$1:$2")
+            .replace(Regex("[^\\p{L}\\p{M}\\p{N}:/]+"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
             .split(' ')
@@ -188,6 +217,13 @@ object VoiceReminderParser {
                     used.addAll(listOf(i, i + 1, i + 2))
                     break
                 }
+                if (m != null && m in 0..59 && tokens[i + 2] in meridianWords) {
+                    hour = h
+                    minute = m
+                    meridian = tokens[i + 2]
+                    used.addAll(listOf(i, i + 1, i + 2))
+                    break
+                }
             }
             if (i + 1 < tokens.size && tokens[i + 1] in clockWords) {
                 hour = h
@@ -222,8 +258,13 @@ object VoiceReminderParser {
             else -> null
         }
         val hour24 = resolveHour(hour, meridian, daypart, tokens, now)
+        val explicitDate = parseExplicitDate(tokens, used)
         val calendar = Calendar.getInstance().apply { timeInMillis = now }
-        if (tokens.any { it in dateParsoWords }) {
+        if (explicitDate != null) {
+            calendar.set(Calendar.DAY_OF_MONTH, 1)
+            calendar.set(Calendar.MONTH, explicitDate.first)
+            calendar.set(Calendar.DAY_OF_MONTH, explicitDate.second)
+        } else if (tokens.any { it in dateParsoWords }) {
             calendar.add(Calendar.DAY_OF_YEAR, 2)
         } else if (tokens.any { it in dateTomorrowWords }) {
             calendar.add(Calendar.DAY_OF_YEAR, 1)
@@ -233,11 +274,57 @@ object VoiceReminderParser {
         calendar.set(Calendar.SECOND, 0)
         calendar.set(Calendar.MILLISECOND, 0)
         var at = calendar.timeInMillis
-        while (at <= now) {
-            calendar.add(Calendar.DAY_OF_YEAR, 1)
-            at = calendar.timeInMillis
+        if (explicitDate != null) {
+            if (at <= now) {
+                calendar.add(Calendar.YEAR, 1)
+                at = calendar.timeInMillis
+            }
+        } else {
+            while (at <= now) {
+                calendar.add(Calendar.DAY_OF_YEAR, 1)
+                at = calendar.timeInMillis
+            }
         }
         return at
+    }
+
+    private fun parseExplicitDate(tokens: List<String>, used: MutableSet<Int>): Pair<Int, Int>? {
+        for (i in tokens.indices) {
+            val numeric = tokens[i].split('/')
+            if (numeric.size == 2) {
+                val day = numeric[0].toIntOrNull()
+                val month = numeric[1].toIntOrNull()
+                if (day != null && day in 1..31 && month != null && month in 1..12) {
+                    used.add(i)
+                    return (month - 1) to day
+                }
+            }
+        }
+        for (i in tokens.indices) {
+            val month = monthWords[tokens[i]] ?: continue
+            var day = -1
+            var dayIndex = -1
+            if (i > 0) {
+                val previous = tokens[i - 1].toIntOrNull()
+                if (previous != null && previous in 1..31) {
+                    day = previous
+                    dayIndex = i - 1
+                }
+            }
+            if (day < 0 && i + 1 < tokens.size) {
+                val next = tokens[i + 1].toIntOrNull()
+                if (next != null && next in 1..31) {
+                    day = next
+                    dayIndex = i + 1
+                }
+            }
+            if (day > 0) {
+                used.add(i)
+                used.add(dayIndex)
+                return month to day
+            }
+        }
+        return null
     }
 
     private fun resolveHour(

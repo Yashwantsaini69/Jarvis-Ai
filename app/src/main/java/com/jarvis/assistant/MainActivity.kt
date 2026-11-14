@@ -715,10 +715,19 @@ class MainActivity : Activity() {
     private fun announceReminder(note: NoteStore.Note) {
         val live = client ?: return
         if (!active) return
-        val title = note.title.ifBlank { "your task" }
-        val body = note.body.ifBlank { title }
-        val prompt = "[SYSTEM] The user's scheduled task is due now: \"$title\". " +
-            "Details: $body. Say one short sentence like: \"Sir, it's time for $title.\""
+        val details = note.title.trim()
+            .ifBlank { note.body.trim() }
+            .ifBlank { "your reminder" }
+        val generic = details.equals("Reminder", ignoreCase = true) ||
+            details.equals("your reminder", ignoreCase = true)
+        val prompt = if (generic) {
+            "[SYSTEM] The user's reminder is due now. " +
+                "Say exactly one short sentence: \"Sir, it's time for your reminder.\""
+        } else {
+            "[SYSTEM] The user's reminder is due now. Task details: \"$details\". " +
+                "Say exactly one short sentence in the user's language using these details, " +
+                "for example: \"Sir, $details.\" Do not use a generic reminder line."
+        }
         live.sendText(prompt)
     }
 

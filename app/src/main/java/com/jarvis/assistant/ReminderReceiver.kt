@@ -13,8 +13,8 @@ class ReminderReceiver : BroadcastReceiver() {
         NoteStore.init(context)
         val note = NoteStore.get(id) ?: return
         NoteStore.clearReminder(id)
-        ReminderNotifier.show(context, note)
         ReminderBus.dispatch(note)
+        ReminderAlarmService.start(context, note.id)
     }
 
     companion object {
@@ -26,7 +26,7 @@ class ReminderReceiver : BroadcastReceiver() {
 class BootReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent?) {
-        ReminderNotifier.ensureChannel(context)
+        ReminderNotifier.ensureChannels(context)
         ReminderScheduler.rescheduleAll(context)
     }
 }
