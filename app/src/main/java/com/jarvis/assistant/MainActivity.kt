@@ -58,6 +58,7 @@ class MainActivity : Activity() {
     private var lastReminderAckAt = 0L
     private var lastReminderIntentAt = 0L
     private var lastReminderNoteId = 0L
+    private var lastReminderRawText = ""
     private var pendingConfirmNoteId = 0L
     private val reminderHandler = Handler(Looper.getMainLooper())
     private var pendingReminderText = ""
@@ -729,8 +730,12 @@ class MainActivity : Activity() {
         acknowledgeReminderCommand()
         val now = SystemClock.elapsedRealtime()
         lastReminderIntentAt = now
-        val sameSlot = parsed.atMillis == lastReminderScheduledAt &&
-            now - lastReminderAt < 8000L
+        val previousRaw = lastReminderRawText
+        val related = previousRaw.isNotBlank() && now - lastReminderAt < 10_000L &&
+            (raw.contains(previousRaw, ignoreCase = true) ||
+                previousRaw.contains(raw, ignoreCase = true))
+        val sameSlot = related || (parsed.atMillis == lastReminderScheduledAt &&
+            now - lastReminderAt < 8000L)
         var id = if (sameSlot) lastReminderNoteId else 0L
         var changed = false
         if (id > 0L) {
@@ -740,8 +745,12 @@ class MainActivity : Activity() {
             } else {
                 val oldDetails = noteDetails(existing)
                 val newDetails = parsedDetails(parsed)
-                if (newDetails.isNotBlank() && newDetails != oldDetails) {
-                    NoteStore.update(id, parsed.title, parsed.body, parsed.atMillis)
+                val detailsChanged = newDetails.isNotBlank() && newDetails != oldDetails
+                val timeChanged = parsed.atMillis != existing.remindAt
+                if (detailsChanged || timeChanged) {
+                    val title = if (newDetails.isNotBlank()) parsed.title else existing.title
+                    val body = if (newDetails.isNotBlank()) parsed.body else existing.body
+                    NoteStore.update(id, title, body, parsed.atMillis)
                     changed = true
                 }
             }
@@ -752,6 +761,7 @@ class MainActivity : Activity() {
             lastReminderNoteId = id
             changed = true
         }
+        lastReminderRawText = raw
         lastReminderScheduledAt = parsed.atMillis
         lastReminderAt = now
         NoteStore.get(id)?.let { ReminderScheduler.schedule(applicationContext, it) }
