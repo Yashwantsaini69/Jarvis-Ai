@@ -1,10 +1,16 @@
 package com.jarvis.assistant
 
+import android.content.Context
+import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.os.Build
 import android.util.Log
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -12,6 +18,7 @@ import kotlin.math.max
 import kotlin.math.sqrt
 
 class AudioEngine(
+    private val context: Context? = null,
     private val onMicChunk: (ByteArray) -> Unit,
     private val onMicLevel: (Float) -> Unit,
     private val onPlaybackLevel: (Float) -> Unit
@@ -19,17 +26,23 @@ class AudioEngine(
     @Volatile
     private var capturing = false
 
+    @Volatile
     private var record: AudioRecord? = null
     private var captureThread: Thread? = null
+    private var aec: AcousticEchoCanceler? = null
+    private var audioManager: AudioManager? = null
+    private var scoActive = false
     private val playback = Playback(onPlaybackLevel)
 
     fun startCapture(): Boolean {
         if (capturing) return true
         Diagnostics.log("AUDIO", "startCapture requested")
+        activateBluetoothInput()
         val audioRecord = createRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
             ?: createRecord(MediaRecorder.AudioSource.MIC)
             ?: run {
                 Diagnostics.log("AUDIO", "startCapture failed: no usable AudioRecord")
+                releaseBluetoothInput()
                 return false
             }
         return try {
@@ -49,6 +62,7 @@ class AudioEngine(
                 audioRecord.release()
             } catch (_: Throwable) {
             }
+            releaseBluetoothInput()
             false
         }
     }
@@ -58,6 +72,12 @@ class AudioEngine(
         capturing = false
         val current = record
         record = null
+        try {
+            aec?.enabled = false
+            aec?.release()
+        } catch (_: Throwable) {
+        }
+        aec = null
         try {
             current?.stop()
         } catch (_: Throwable) {
@@ -71,6 +91,7 @@ class AudioEngine(
         } catch (_: Throwable) {
         }
         captureThread = null
+        releaseBluetoothInput()
     }
 
     fun play(data: ByteArray) {
@@ -112,6 +133,8 @@ class AudioEngine(
             if (created.state == AudioRecord.STATE_INITIALIZED) {
                 Diagnostics.log("AUDIO", "$sourceName initialized buffer=$bufferSize")
                 Diagnostics.setMicSource("$sourceName/16000/mono/pcm16")
+                enableAec(created)
+                preferBluetoothInput(created)
                 created
             } else {
                 Diagnostics.log("AUDIO", "$sourceName not initialized state=${created.state}")
@@ -123,6 +146,194 @@ class AudioEngine(
             Diagnostics.log("AUDIO", "$sourceName create failed: ${t.message ?: t.javaClass.simpleName}")
             null
         }
+    }
+
+    private fun enableAec(audioRecord: AudioRecord) {
+        try {
+            if (!AcousticEchoCanceler.isAvailable()) {
+                Diagnostics.log("AUDIO", "AEC not available")
+                return
+            }
+            aec?.release()
+            aec = AcousticEchoCanceler.create(audioRecord.audioSessionId)?.apply { enabled = true }
+            Diagnostics.log("AUDIO", "AEC enabled=${aec?.enabled == true}")
+        } catch (t: Throwable) {
+            Diagnostics.log("AUDIO", "AEC setup failed: ${t.message ?: t.javaClass.simpleName}")
+        }
+    }
+
+    private fun audioManager(): AudioManager? {
+        audioManager?.let { return it }
+        val appContext = context ?: return null
+        val manager = try {
+            appContext.getSystemService(AudioManager::class.java)
+        } catch (_: Throwable) {
+            null
+        }
+        audioManager = manager
+        return manager
+    }
+
+    private fun hasBluetoothPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        val appContext = context ?: return false
+        return appContext.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun activateBluetoothInput() {
+        val manager = audioManager() ?: return
+        try {
+            logAudioDevices(manager)
+            if (!hasBluetoothPermission()) {
+                Diagnostics.log("AUDIO", "SCO skipped: BLUETOOTH_CONNECT not granted")
+                return
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                var sco = manager.availableCommunicationDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                }
+                if (sco == null && hasA2dpOutput(manager)) {
+                    Diagnostics.log("AUDIO", "SCO missing, requesting HFP")
+                    try {
+                        @Suppress("DEPRECATION")
+                        manager.startBluetoothSco()
+                        @Suppress("DEPRECATION")
+                        manager.isBluetoothScoOn = true
+                    } catch (t: Throwable) {
+                        Diagnostics.log(
+                            "AUDIO",
+                            "startBluetoothSco failed: ${t.message ?: t.javaClass.simpleName}"
+                        )
+                    }
+                    scheduleScoRecheck()
+                    return
+                }
+                if (sco == null) {
+                    Diagnostics.log("AUDIO", "SCO device: none")
+                    return
+                }
+                val ok = manager.setCommunicationDevice(sco)
+                scoActive = ok
+                Diagnostics.log("AUDIO", "SCO route=$ok name=${sco.productName}")
+            } else {
+                @Suppress("DEPRECATION")
+                manager.startBluetoothSco()
+                @Suppress("DEPRECATION")
+                manager.isBluetoothScoOn = true
+                scoActive = true
+                Diagnostics.log("AUDIO", "SCO legacy start")
+            }
+        } catch (t: Throwable) {
+            Diagnostics.log("AUDIO", "SCO setup failed: ${t.message ?: t.javaClass.simpleName}")
+        }
+    }
+
+    private fun hasA2dpOutput(manager: AudioManager): Boolean = try {
+        manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+        }
+    } catch (_: Throwable) {
+        false
+    }
+
+    private fun scheduleScoRecheck() {
+        Thread({
+            repeat(4) {
+                try {
+                    Thread.sleep(300)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                if (!capturing && record == null) return@Thread
+                val manager = audioManager() ?: return@Thread
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return@Thread
+                val sco = try {
+                    manager.availableCommunicationDevices.firstOrNull {
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                    }
+                } catch (_: Throwable) {
+                    null
+                }
+                if (sco != null) {
+                    val routed = try {
+                        manager.setCommunicationDevice(sco)
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    val preferred = try {
+                        record?.setPreferredDevice(sco) ?: false
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    scoActive = routed || preferred
+                    Diagnostics.log(
+                        "AUDIO",
+                        "SCO recheck route=$routed preferred=$preferred"
+                    )
+                    return@Thread
+                }
+            }
+            Diagnostics.log("AUDIO", "SCO recheck: still none")
+        }, "jarvis-sco").apply { isDaemon = true }.start()
+    }
+
+    private fun logAudioDevices(manager: AudioManager) {
+        try {
+            val all = manager.getDevices(AudioManager.GET_DEVICES_ALL)
+                .joinToString(limit = 8) { "${typeName(it.type)}:${it.productName}" }
+            Diagnostics.log("BT", "devices=$all")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val comm = manager.availableCommunicationDevices
+                    .joinToString(limit = 8) { "${typeName(it.type)}:${it.productName}" }
+                Diagnostics.log("BT", "comm=$comm")
+            }
+        } catch (t: Throwable) {
+            Diagnostics.log("BT", "device scan failed: ${t.message ?: t.javaClass.simpleName}")
+        }
+    }
+
+    private fun typeName(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "MIC"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "SPEAKER"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "A2DP"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "SCO"
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "WIRED"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "WIRED_HS"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "USB_HS"
+        else -> type.toString()
+    }
+
+    private fun preferBluetoothInput(audioRecord: AudioRecord) {
+        if (!hasBluetoothPermission()) return
+        try {
+            val manager = audioManager() ?: return
+            val input = manager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            } ?: return
+            val ok = audioRecord.setPreferredDevice(input)
+            Diagnostics.log("AUDIO", "preferred input BT_SCO=$ok name=${input.productName}")
+        } catch (t: Throwable) {
+            Diagnostics.log("AUDIO", "preferred input failed: ${t.message ?: t.javaClass.simpleName}")
+        }
+    }
+
+    private fun releaseBluetoothInput() {
+        val manager = audioManager() ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (scoActive) manager.clearCommunicationDevice()
+            }
+            if (scoActive) {
+                @Suppress("DEPRECATION")
+                manager.isBluetoothScoOn = false
+                @Suppress("DEPRECATION")
+                manager.stopBluetoothSco()
+            }
+        } catch (_: Throwable) {
+        }
+        if (scoActive) Diagnostics.log("AUDIO", "SCO released")
+        scoActive = false
     }
 
     private fun sourceName(source: Int): String = when (source) {

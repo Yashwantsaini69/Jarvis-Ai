@@ -69,6 +69,8 @@ class GeminiLiveClient(
     private val cancelledCalls: MutableSet<String> =
         Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
+    private val recentActions = HashMap<String, Long>()
+
     private val searchExecutor = Executors.newSingleThreadExecutor()
 
     private companion object {
@@ -196,6 +198,10 @@ class GeminiLiveClient(
         for (i in 0 until deviceFunctions.length()) {
             functions.put(deviceFunctions.get(i))
         }
+        val learningFunctions = learningFunctionDeclarations()
+        for (i in 0 until learningFunctions.length()) {
+            functions.put(learningFunctions.get(i))
+        }
         val tools = JSONArray().put(
             JSONObject().put("functionDeclarations", functions)
         )
@@ -283,7 +289,89 @@ class GeminiLiveClient(
         )
 
     private fun isDeviceFunction(name: String): Boolean = name == "open_app" ||
-        name == "open_url"
+        name == "open_url" ||
+        name == "start_lesson" ||
+        name == "show_word" ||
+        name == "save_progress" ||
+        name == "close_lesson"
+
+    private fun learningFunctionDeclarations(): JSONArray = JSONArray().apply {
+        put(
+            learningFunction(
+                "start_lesson",
+                "Start or continue a language lesson for Bengali, French or Russian. Call " +
+                    "this whenever the user asks to learn, start or continue a language.",
+                JSONObject().put(
+                    "language",
+                    learningParam("STRING", "Language: Bengali, French or Russian")
+                ),
+                listOf("language")
+            )
+        )
+        put(
+            learningFunction(
+                "show_word",
+                "Show one vocabulary word on screen in large text while teaching. Call once " +
+                    "per word, before you speak it.",
+                JSONObject()
+                    .put("language", learningParam("STRING", "Language name"))
+                    .put("term", learningParam("STRING", "Word in its native script"))
+                    .put("transliteration", learningParam("STRING", "Latin transliteration"))
+                    .put("meaning", learningParam("STRING", "Hindi or English meaning"))
+                    .put("example", learningParam("STRING", "One short example sentence")),
+                listOf("language", "term", "transliteration", "meaning")
+            )
+        )
+        put(
+            learningFunction(
+                "save_progress",
+                "Save the learner's progress after finishing a lesson.",
+                JSONObject()
+                    .put("language", learningParam("STRING", "Language name"))
+                    .put("lesson", learningParam("INTEGER", "Completed lesson number"))
+                    .put("summary", learningParam("STRING", "One line summary of the lesson"))
+                    .put("next_plan", learningParam("STRING", "What to do next time"))
+                    .put(
+                        "weak_words",
+                        learningParam("STRING", "Comma separated words to revise")
+                    )
+                    .put(
+                        "new_words",
+                        learningParam("STRING", "Comma separated words taught today")
+                    ),
+                listOf("language", "lesson")
+            )
+        )
+        put(
+            learningFunction(
+                "close_lesson",
+                "Close the language lesson screen when the user wants to stop.",
+                JSONObject(),
+                emptyList()
+            )
+        )
+    }
+
+    private fun learningFunction(
+        name: String,
+        description: String,
+        properties: JSONObject,
+        required: List<String>
+    ): JSONObject {
+        val declaration = JSONObject().put("name", name).put("description", description)
+        if (properties.length() > 0) {
+            val params = JSONObject().put("type", "OBJECT").put("properties", properties)
+            if (required.isNotEmpty()) {
+                params.put("required", JSONArray().apply { required.forEach { put(it) } })
+            }
+            declaration.put("parameters", params)
+        }
+        return declaration
+    }
+
+    private fun learningParam(type: String, description: String): JSONObject =
+        JSONObject().put("type", type).put("description", description)
+
 
     private fun searchFunctionDeclaration(): JSONObject {
         val declaration = JSONObject()
@@ -320,6 +408,19 @@ class GeminiLiveClient(
             val name = call.optString("name", "")
             Log.d("JarvisLive", "toolCall name=$name id=$id")
             Diagnostics.log("LIVE", "toolCall name=$name id=$id")
+            if (isAppFunction(name) || isDeviceFunction(name)) {
+                val argsKey = call.optJSONObject("args")?.toString() ?: ""
+                val key = "$name|$argsKey"
+                val now = SystemClock.elapsedRealtime()
+                val last = recentActions[key]
+                if (last != null && now - last < 1500L) {
+                    Diagnostics.log("LIVE", "toolCall dedupe name=$name")
+                    sendToolResponse(id, name, "Already handled.")
+                    continue
+                }
+                if (recentActions.size > 40) recentActions.clear()
+                recentActions[key] = now
+            }
             if (isAppFunction(name)) {
                 handler.post { listener.onAppCommand(name) }
                 sendToolResponse(id, name, "ok")

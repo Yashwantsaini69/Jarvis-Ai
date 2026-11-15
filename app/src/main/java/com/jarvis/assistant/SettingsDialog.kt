@@ -31,7 +31,8 @@ import android.widget.Toast
 class SettingsDialog(
     context: Context,
     private val onSaved: () -> Unit,
-    private val onCheckUpdates: () -> Unit = {}
+    private val onCheckUpdates: () -> Unit = {},
+    private val onSetAssistant: () -> Unit = {}
 ) : Dialog(context) {
     private lateinit var instructionInput: EditText
     private lateinit var voiceValue: TextView
@@ -42,7 +43,6 @@ class SettingsDialog(
     private val orbCells = mutableListOf<LinearLayout>()
     private var preview: VoicePreview? = null
     private var previewToken = 0
-
     private val helpText = """
         JARVIS HELP
 
@@ -242,6 +242,30 @@ class SettingsDialog(
             matchWrap().apply { topMargin = context.dp(8f) }
         )
 
+        val assistant = TextView(context).apply {
+            text = "SET AS DEFAULT ASSISTANT"
+            textSize = 10.5f
+            letterSpacing = 0.22f
+            typeface = context.font(10.5f, true)
+            gravity = Gravity.CENTER
+            setTextColor(Palette.ice)
+            background = context.roundedBackground(
+                Palette.panel,
+                withAlpha(Palette.cyan, 0.35f),
+                15f,
+                1f
+            )
+            setPadding(context.dp(14f), context.dp(15f), context.dp(14f), context.dp(15f))
+            isClickable = true
+            contentDescription = "Set Jarvis as the default assistant"
+            setOnClickListener { onSetAssistant() }
+        }
+        content.addView(assistant, matchWrap().apply { topMargin = context.dp(8f) })
+        content.addView(
+            helperText("Opens Android's digital assistant picker — choose Jarvis. Then earbud long-press opens Jarvis and starts listening, even with the phone locked in your pocket."),
+            matchWrap().apply { topMargin = context.dp(8f) }
+        )
+
         voiceValue = addSelector(content, "VOICE", selectedVoice) { valueView ->
             showVoiceChooser(valueView)
         }
@@ -374,16 +398,6 @@ class SettingsDialog(
             }
         }
         content.addView(overlayRow, matchWrap().apply { topMargin = context.dp(8f) })
-        content.addView(
-            helperText("Required for \"WhatsApp kholo\" after YouTube. Android may show a Play Protect warning for this permission; Jarvis never reads your screen."),
-            matchWrap().apply { topMargin = context.dp(8f) }
-        )
-
-        addSection(content, "VOICE CONTROL")
-        content.addView(
-            helperText("While muted, say \u201cHey Jarvis\u201d to unmute. Jarvis only listens for this locally during a muted live session; there is no background wake service."),
-            matchWrap().apply { topMargin = context.dp(8f) }
-        )
 
         addSection(content, "SYSTEM INSTRUCTIONS")
         val instructionHeader = LinearLayout(context).apply {
@@ -431,12 +445,6 @@ class SettingsDialog(
         }
         instructionBox.addView(instructionInput, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         content.addView(instructionBox, matchWrap().apply { topMargin = context.dp(8f) })
-        content.addView(
-            helperText("These are optional additions only. The permanent Jarvis core identity is never shown here and cannot be viewed, edited, cleared or overridden.").apply {
-                maxLines = 6
-            },
-            matchWrap().apply { topMargin = context.dp(8f) }
-        )
 
         addSection(content, "ORB DESIGN")
         content.addView(
@@ -482,6 +490,34 @@ class SettingsDialog(
                 setMargins(context.dp(4f), context.dp(4f), context.dp(4f), context.dp(4f))
             })
         }
+
+        val aboutBar = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = context.roundedBackground(
+                Palette.panel,
+                withAlpha(Palette.cyan, 0.18f),
+                15f,
+                1f
+            )
+            setPadding(context.dp(14f), context.dp(15f), context.dp(14f), context.dp(15f))
+            isClickable = true
+            contentDescription = "Open About Me"
+            setOnClickListener { AboutDialog(context).show() }
+        }
+        aboutBar.addView(
+            context.label("ABOUT ME", 10.5f, Palette.cyan, 0.22f, true),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        aboutBar.addView(
+            context.label("TAP TO OPEN", 9f, Palette.textFaint, 0.12f, false)
+        )
+        aboutBar.addView(
+            context.label("›", 18f, Palette.cyan, 0f, true).apply {
+                setPadding(context.dp(10f), 0, 0, 0)
+            }
+        )
+        content.addView(aboutBar, matchWrap().apply { topMargin = context.dp(24f) })
 
         val saveRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -530,18 +566,6 @@ class SettingsDialog(
             }
         )
         content.addView(saveRow, matchWrap().apply { topMargin = context.dp(28f) })
-
-        content.addView(
-            context.label(
-                "Built with the Gemini Live API  •  jarvis.assistant",
-                9f,
-                Palette.textFaint,
-                0.08f,
-                false,
-                Gravity.CENTER
-            ),
-            matchWrap().apply { topMargin = context.dp(18f) }
-        )
 
         setContentView(root)
         content.applySystemBarPadding()
@@ -643,6 +667,15 @@ class SettingsDialog(
                 } catch (_: Throwable) {
                     Toast.makeText(context, "No app available to share", Toast.LENGTH_SHORT).show()
                 }
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = context.dp(8f)
+            }
+        )
+        firstRow.addView(
+            diagnosticButton("EXPORT") {
+                val result = Diagnostics.export(context)
+                Toast.makeText(context, result, Toast.LENGTH_LONG).show()
             },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginStart = context.dp(8f)

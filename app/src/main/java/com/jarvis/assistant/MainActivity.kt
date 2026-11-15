@@ -4,17 +4,25 @@ import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.Dialog
+import android.app.role.RoleManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.provider.Settings
 import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -59,6 +67,12 @@ class MainActivity : Activity() {
     private var unmuteListening = false
     private var unmuteStartToken = 0
     private var lastAutoConnectAt = 0L
+    private var lastAssistTriggerAt = 0L
+    private var mediaSession: MediaSession? = null
+    private var mediaButtonsActive = false
+    private var learningOverlay: LearningOverlay? = null
+    private var learningActive = false
+    private var learningLanguage = ""
     private var lastNoteSignature = ""
     private var lastNoteAt = 0L
     private var lastReminderScheduledAt = 0L
@@ -103,6 +117,10 @@ class MainActivity : Activity() {
         val text = pendingVoiceLocalText
         pendingVoiceLocalText = ""
         if (text.isNotBlank()) {
+            if (suppressVoiceCommand(text)) {
+                Diagnostics.log("FALLBACK", "skip echo at run '${text.take(180)}'")
+                return@Runnable
+            }
             val handled = handleLocalCommandOnly(text)
             Log.d("JarvisDebug", "voice local fallback '$text' handled=$handled")
             Diagnostics.log("FALLBACK", "run '${text.take(180)}' handled=$handled")
@@ -120,6 +138,11 @@ class MainActivity : Activity() {
     private val reminderAckTimeout = Runnable { if (reminderAckAwaiting) finishReminderAck() }
     private val reminderFailureCheck = Runnable { maybeSpeakReminderFailure() }
     private val assistantTurnText = StringBuilder()
+    private var lastAssistantOutput = ""
+    private var lastAssistantOutputAt = 0L
+    private var lastHandledVoiceText = ""
+    private var lastInterruptedAt = 0L
+    private val finalizeVoiceRunnable = Runnable { finalizeVoiceTurn() }
     private var connectionWatchdog: Runnable? = null
     private var updatePromptVisible = false
     private var connectedSoundPlayed = false
@@ -137,6 +160,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Diagnostics.log("APP", "onCreate")
+        Diagnostics.log("APP", "launch action=${intent?.action} flags=${intent?.flags}")
         JarvisPrefs.init(applicationContext)
         ChatStore.init(applicationContext)
         MemoryStore.init(applicationContext)
@@ -151,17 +175,22 @@ class MainActivity : Activity() {
         window.navigationBarColor = Palette.bg
         buildUi()
         applyIdleUi(firstRun = true)
+        ensureMediaSession()
         val openNotesFromIntent = intent?.getBooleanExtra("open_notes", false) == true
         if (openNotesFromIntent) intent.removeExtra("open_notes")
         if (openNotesFromIntent) window.decorView.post { openNotes() }
         window.decorView.postDelayed({
             if (!isFinishing && !isDestroyed && !active && !connecting) autoConnectIfIdle()
         }, 150L)
+        if (isAssistIntent(intent)) {
+            window.decorView.postDelayed({ handleAssistTrigger() }, 250L)
+        }
         window.decorView.postDelayed({ checkForUpdates(manual = false) }, 1500L)
     }
 
     override fun onStart() {
         super.onStart()
+        deactivateMediaButtons()
         ChatStore.addListener(chatListener)
         if (!active && !connecting) {
             statusLabel.text = "STANDBY"
@@ -186,10 +215,12 @@ class MainActivity : Activity() {
 
     override fun onStop() {
         ChatStore.removeListener(chatListener)
+        if (active || connecting) activateMediaButtons()
         super.onStop()
     }
 
     override fun onDestroy() {
+        releaseMediaSession()
         stopUnmuteDetector()
         try {
             unmuteDetector?.release()
@@ -200,6 +231,7 @@ class MainActivity : Activity() {
         reminderHandler.removeCallbacks(parsePendingReminder)
         pendingReminderText = ""
         cancelVoiceLocalFallback()
+        cancelVoiceFinalize()
         voiceTurnFinished = true
         voiceFallbackHandled = false
         resetReminderConfirmation()
@@ -215,9 +247,206 @@ class MainActivity : Activity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         setIntent(intent)
+        Diagnostics.log("APP", "newIntent action=${intent?.action} flags=${intent?.flags}")
         if (intent?.getBooleanExtra("open_notes", false) == true) {
             intent.removeExtra("open_notes")
             openNotes()
+        }
+        if (isAssistIntent(intent)) {
+            window.decorView.post { handleAssistTrigger() }
+        }
+    }
+
+    private fun isAssistIntent(intent: Intent?): Boolean {
+        val action = intent?.action ?: return false
+        return action == Intent.ACTION_ASSIST || action == Intent.ACTION_VOICE_COMMAND
+    }
+
+    private fun handleAssistTrigger() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastAssistTriggerAt < 1200L) return
+        lastAssistTriggerAt = now
+        Diagnostics.log(
+            "ASSIST",
+            "trigger active=$active connecting=$connecting muted=$micMuted " +
+                "interactive=${isScreenInteractive()}"
+        )
+        pocketFeedback()
+        if (!JarvisPrefs.hasApiKey()) {
+            toast("Add your Gemini API key in Settings")
+            return
+        }
+        if (!active && !connecting) {
+            startFlow()
+        } else if (micMuted) {
+            setMicMuted(false)
+        }
+        if (!isScreenInteractive()) {
+            window.decorView.postDelayed({
+                if (!isFinishing && !isDestroyed) moveTaskToBack(true)
+            }, 600L)
+        }
+    }
+
+    private fun isScreenInteractive(): Boolean {
+        val power = getSystemService(PowerManager::class.java) ?: return true
+        return power.isInteractive
+    }
+
+    private fun pocketFeedback() {
+        Diagnostics.log("ASSIST", "pocket feedback")
+        try {
+            val vibrator = getSystemService(Vibrator::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(
+                    VibrationEffect.createOneShot(90L, VibrationEffect.DEFAULT_AMPLITUDE)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(90L)
+            }
+        } catch (_: Throwable) {
+        }
+        ConnectionSounds.playListening()
+    }
+
+    private fun ensureMediaSession() {
+        if (mediaSession != null) return
+        try {
+            val session = MediaSession(this, "JarvisEarbud")
+            session.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS)
+            session.setCallback(object : MediaSession.Callback() {
+                override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
+                    val event: KeyEvent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        mediaButtonIntent.getParcelableExtra(
+                            Intent.EXTRA_KEY_EVENT,
+                            KeyEvent::class.java
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        mediaButtonIntent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
+                    }
+                    if (event != null) return handleMediaButton(event)
+                    return super.onMediaButtonEvent(mediaButtonIntent)
+                }
+            })
+            session.setPlaybackState(mediaPlaybackState())
+            mediaSession = session
+            Diagnostics.log("MEDIA", "media session created")
+        } catch (t: Throwable) {
+            Diagnostics.log(
+                "MEDIA",
+                "media session failed: ${t.message ?: t.javaClass.simpleName}"
+            )
+        }
+    }
+
+    private fun mediaPlaybackState(): PlaybackState =
+        PlaybackState.Builder()
+            .setActions(
+                PlaybackState.ACTION_PLAY or
+                    PlaybackState.ACTION_PAUSE or
+                    PlaybackState.ACTION_PLAY_PAUSE
+            )
+            .setState(PlaybackState.STATE_PAUSED, 0L, 1f)
+            .build()
+
+    private fun activateMediaButtons() {
+        val session = mediaSession ?: return
+        if (mediaButtonsActive) return
+        try {
+            session.setPlaybackState(mediaPlaybackState())
+            session.isActive = true
+            mediaButtonsActive = true
+            Diagnostics.log("MEDIA", "earbud buttons -> Jarvis (background)")
+        } catch (t: Throwable) {
+            Diagnostics.log("MEDIA", "activate failed: ${t.message ?: t.javaClass.simpleName}")
+        }
+    }
+
+    private fun deactivateMediaButtons() {
+        if (!mediaButtonsActive) return
+        try {
+            mediaSession?.isActive = false
+        } catch (_: Throwable) {
+        }
+        mediaButtonsActive = false
+        Diagnostics.log("MEDIA", "earbud buttons released (foreground)")
+    }
+
+    private fun releaseMediaSession() {
+        deactivateMediaButtons()
+        try {
+            mediaSession?.release()
+        } catch (_: Throwable) {
+        }
+        mediaSession = null
+    }
+
+    private fun handleMediaButton(event: KeyEvent): Boolean {
+        if (event.keyCode !in MEDIA_TRIGGER_KEYS) return false
+        if (event.action == KeyEvent.ACTION_UP) return true
+        if (event.action != KeyEvent.ACTION_DOWN) return false
+        if (event.repeatCount > 0) return true
+        Diagnostics.log(
+            "MEDIA",
+            "earbud button code=${event.keyCode} active=$active " +
+                "connecting=$connecting muted=$micMuted playback=${isPlaybackSpeaking()}"
+        )
+        if (isPlaybackSpeaking()) {
+            audio?.interrupt()
+            pocketFeedback()
+            return true
+        }
+        handleAssistTrigger()
+        return true
+    }
+
+    private fun requestAssistantRole() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val role = getSystemService(RoleManager::class.java)
+            if (role?.isRoleHeld(RoleManager.ROLE_ASSISTANT) == true) {
+                toast("Jarvis is already your default assistant")
+                return
+            }
+            Diagnostics.log(
+                "ASSIST",
+                "role available=${role?.isRoleAvailable(RoleManager.ROLE_ASSISTANT)} " +
+                    "held=${role?.isRoleHeld(RoleManager.ROLE_ASSISTANT)}"
+            )
+        }
+        try {
+            startActivityForResult(
+                Intent(Settings.ACTION_VOICE_INPUT_SETTINGS),
+                REQUEST_ASSISTANT_ROLE
+            )
+            toast("Choose Jarvis as the digital assistant app")
+        } catch (_: Throwable) {
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
+                toast("Open Default apps > Digital assistant app > Jarvis")
+            } catch (_: Throwable) {
+                toast("Open Settings > Apps > Default apps > Digital assistant app")
+            }
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_ASSISTANT_ROLE) {
+            val held = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                getSystemService(RoleManager::class.java)
+                    ?.isRoleHeld(RoleManager.ROLE_ASSISTANT) == true
+            } else {
+                false
+            }
+            if (held) {
+                toast("Jarvis is now your default assistant — long-press your earbud")
+                Diagnostics.log("ASSIST", "role held after picker")
+            } else {
+                toast("Jarvis not selected — choose it in the assistant list")
+                Diagnostics.log("ASSIST", "role still not held result=$resultCode")
+            }
         }
     }
 
@@ -351,6 +580,21 @@ class MainActivity : Activity() {
 
         setContentView(root)
         content.applySystemBarPadding()
+
+        val overlay = LearningOverlay(
+            this,
+            onRepeat = { text -> client?.sendText(text) },
+            onClose = { closeLearning() }
+        )
+        root.addView(
+            overlay,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        overlay.applySystemBarPadding()
+        learningOverlay = overlay
     }
 
     private fun matchWrap(): LinearLayout.LayoutParams =
@@ -390,6 +634,11 @@ class MainActivity : Activity() {
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             missing.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+        ) {
+            missing.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
         if (missing.isNotEmpty()) {
             requestPermissions(missing.toTypedArray(), REQUEST_PERMISSIONS)
@@ -449,6 +698,7 @@ class MainActivity : Activity() {
         JarvisSessionService.start(this)
 
         audio = AudioEngine(
+            applicationContext,
             onMicChunk = { chunk ->
                 client?.sendAudio(if (micMuted) ByteArray(chunk.size) else chunk)
             },
@@ -464,7 +714,11 @@ class MainActivity : Activity() {
         val memoryBlock = MemoryStore.promptBlock()
         val baseInstruction = JarvisPrefs.effectiveInstruction() + "\n\n" +
             APP_CONTROL_INSTRUCTION + "\n\n" + DEVICE_CONTROL_INSTRUCTION + "\n\n" +
-            SYSTEM_CLOCK_INSTRUCTION + "\n\n" + SILENT_COMMAND_INSTRUCTION
+            MEDIA_CONTROL_INSTRUCTION + "\n\n" +
+            SYSTEM_CLOCK_INSTRUCTION + "\n\n" + SILENT_COMMAND_INSTRUCTION + "\n\n" +
+            LANGUAGE_TUTOR_INSTRUCTION + "\n\n" +
+            LearningStore.promptBlock(this) + "\n\n" +
+            CAPABILITY_LIMITS_INSTRUCTION
         val systemInstruction = if (memoryBlock.isBlank()) {
             baseInstruction
         } else {
@@ -507,10 +761,13 @@ class MainActivity : Activity() {
     }
 
     private fun releaseSession() {
+        closeLearning()
+        deactivateMediaButtons()
         stopUnmuteDetector()
         reminderHandler.removeCallbacks(parsePendingReminder)
         pendingReminderText = ""
         cancelVoiceLocalFallback()
+        cancelVoiceFinalize()
         voiceTurnFinished = true
         voiceFallbackHandled = false
         resetReminderConfirmation()
@@ -631,8 +888,8 @@ class MainActivity : Activity() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
         val detector = unmuteDetector ?: WakeDetector.Builder(this)
             .setModel(WakeDetector.BuiltInModel.HEY_JARVIS)
-            .setThreshold(0.4f)
-            .setDebounceMs(2500L)
+            .setThreshold(0.65f)
+            .setDebounceMs(3000L)
             .build()
             .also {
                 it.onError = { message ->
@@ -654,6 +911,7 @@ class MainActivity : Activity() {
             }
             detector.start {
                 if (token != unmuteStartToken || !micMuted) return@start
+                Diagnostics.log("MIC", "unmute detector trigger -> microphone on")
                 unmuteListening = false
                 unmuteStartToken++
                 setMicMuted(false)
@@ -900,6 +1158,11 @@ class MainActivity : Activity() {
             "handle allowNote=$allowNoteCreate skipLocal=$skipLocal " +
                 "raw='${raw.take(180)}' latest='${command.take(180)}'"
         )
+        if (learningActive) {
+            if (allowNoteCreate && handleLearningExit(command)) return true
+            Diagnostics.log("CMD", "learning mode skip")
+            return false
+        }
         if (allowNoteCreate && handlePendingBulkDelete(command)) {
             Diagnostics.log("CMD", "handled by=pendingBulkDelete")
             return true
@@ -955,12 +1218,16 @@ class MainActivity : Activity() {
 
     private fun scheduleVoiceLocalFallback(text: String) {
         if (text.isBlank()) return
+        if (suppressVoiceCommand(text)) {
+            Diagnostics.log("FALLBACK", "skip echo/playback '${text.take(180)}'")
+            return
+        }
         if (pendingVoiceLocalText != text) {
             Diagnostics.log("FALLBACK", "arm '${text.take(180)}'")
         }
         pendingVoiceLocalText = text
         voiceLocalHandler.removeCallbacks(runPendingVoiceLocal)
-        voiceLocalHandler.postDelayed(runPendingVoiceLocal, 2500L)
+        voiceLocalHandler.postDelayed(runPendingVoiceLocal, 1200L)
     }
 
     private fun cancelVoiceLocalFallback() {
@@ -968,8 +1235,62 @@ class MainActivity : Activity() {
         pendingVoiceLocalText = ""
     }
 
+    private fun scheduleVoiceFinalize() {
+        voiceLocalHandler.removeCallbacks(finalizeVoiceRunnable)
+        voiceLocalHandler.postDelayed(finalizeVoiceRunnable, 220L)
+    }
+
+    private fun cancelVoiceFinalize() {
+        voiceLocalHandler.removeCallbacks(finalizeVoiceRunnable)
+    }
+
+    private fun isPlaybackSpeaking(): Boolean = audio?.isPlaybackIdle() == false
+
+    private fun suppressVoiceCommand(text: String): Boolean {
+        if (text.isBlank()) return true
+        return looksLikeEcho(text)
+    }
+
+    private fun looksLikeEcho(text: String): Boolean {
+        val output = lastAssistantOutput.lowercase()
+        if (output.isBlank()) return false
+        if (SystemClock.elapsedRealtime() - lastAssistantOutputAt > 8000L) return false
+        val words = text.lowercase()
+            .split(Regex("[^\\p{L}\\p{M}\\p{N}]+"))
+            .filter { it.length >= 3 }
+            .distinct()
+        if (words.size < 3) return false
+        val matches = words.count { output.contains(it) }
+        return matches * 10 >= words.size * 8
+    }
+
+    private fun finalizeVoiceTurn() {
+        if (!active) return
+        val last = ChatStore.snapshot().lastOrNull {
+            it.role == ChatStore.Role.USER && it.text.isNotBlank()
+        } ?: return
+        val text = last.text
+        if (text == lastHandledVoiceText) return
+        if (suppressVoiceCommand(text)) {
+            Diagnostics.log("ASR", "finalize skip echo text='${text.take(180)}'")
+            cancelVoiceLocalFallback()
+            return
+        }
+        lastHandledVoiceText = text
+        cancelVoiceLocalFallback()
+        voiceTurnFinished = true
+        val handled = handleLocalCommandOnly(text)
+        voiceFallbackHandled = handled
+        Diagnostics.log("ASR", "finalize local handled=$handled text='${text.take(180)}'")
+    }
+
     private fun handleLocalCommandOnly(raw: String): Boolean {
         val command = SpeechCorrectionResolver.latestInstruction(raw)
+        if (learningActive) {
+            if (handleLearningExit(command)) return true
+            Diagnostics.log("LOCAL", "learning mode skip")
+            return false
+        }
         if (handleSystemClockCommand(command, allowAsk = false)) {
             Diagnostics.log("LOCAL", "clock handled")
             return true
@@ -984,6 +1305,88 @@ class MainActivity : Activity() {
         }
         Diagnostics.log("LOCAL", "not handled")
         return false
+    }
+
+    private fun handleLearningTool(name: String, args: JSONObject): String {
+        if (name == "close_lesson") {
+            closeLearning()
+            return "Lesson closed."
+        }
+        val requested = args.optString("language", learningLanguage)
+        val code = LearningStore.normalize(requested)
+            ?: learningLanguage.takeIf { it.isNotBlank() }
+            ?: return "Language must be Bengali, French or Russian."
+        learningLanguage = code
+        val progress = LearningStore.progress(this, code)
+        when (name) {
+            "start_lesson" -> {
+                learningActive = true
+                LearningStore.setLast(this, code)
+                learningOverlay?.showLesson(learningTitle(code), progress.lesson + 1)
+                learningOverlay?.show()
+                Diagnostics.log(
+                    "LEARN",
+                    "start code=$code lesson=${progress.lesson + 1}"
+                )
+                return LearningStore.tutorContext(this, code)
+            }
+            "show_word" -> {
+                val term = args.optString("term", "").trim()
+                if (term.isBlank()) return "Missing word."
+                learningActive = true
+                learningOverlay?.showLesson(learningTitle(code), progress.lesson + 1)
+                learningOverlay?.showWord(
+                    term,
+                    args.optString("transliteration", ""),
+                    args.optString("meaning", ""),
+                    args.optString("example", "")
+                )
+                learningOverlay?.show()
+                Diagnostics.log("LEARN", "word code=$code term='${term.take(40)}'")
+                return "Word shown on screen: $term"
+            }
+            "save_progress" -> {
+                val lesson = args.optString("lesson", "").toIntOrNull()
+                    ?: args.optInt("lesson", progress.lesson + 1)
+                LearningStore.save(
+                    this,
+                    code,
+                    lesson,
+                    args.optString("summary", ""),
+                    args.optString("next_plan", ""),
+                    args.optString("weak_words", ""),
+                    args.optString("new_words", "")
+                )
+                learningOverlay?.showLesson(learningTitle(code), lesson + 1)
+                Diagnostics.log("LEARN", "saved code=$code lesson=$lesson")
+                return "Progress saved for ${LearningStore.displayName(code)}."
+            }
+        }
+        return "Unknown learning action."
+    }
+
+    private fun learningTitle(code: String): String =
+        "${LearningStore.displayName(code)} • ${LearningStore.nativeName(code)}"
+
+    private fun closeLearning() {
+        if (learningActive) Diagnostics.log("LEARN", "closed")
+        learningActive = false
+        learningOverlay?.hide()
+    }
+
+    private fun handleLearningExit(raw: String): Boolean {
+        if (!learningActive) return false
+        val t = raw.lowercase()
+        val phrases = listOf(
+            "close lesson", "end lesson", "stop lesson", "exit learning",
+            "lesson band", "language band", "language mode band", "padhai band",
+            "पाठ बंद", "सीखना बंद"
+        )
+        if (phrases.none { t.contains(it) }) return false
+        closeLearning()
+        beginSilentTurn()
+        toast("Language mode closed")
+        return true
     }
 
     private fun wordSet(raw: String): Set<String> = raw.lowercase()
@@ -1034,8 +1437,9 @@ class MainActivity : Activity() {
     ): Boolean {
         val deleteWords = setOf(
             "delete", "remove", "cancel", "dismiss", "band", "off", "hatao",
-            "hata", "mita", "mitao", "clear", "dlt", "डिलीट", "हटाओ", "हटा",
-            "मिटाओ", "मिटा", "कैंसिल", "बंद", "बन्द", "ऑफ"
+            "hata", "mita", "mitao", "clear", "dlt", "close", "kloj", "cloj",
+            "डिलीट", "हटाओ", "हटा", "मिटाओ", "मिटा", "कैंसिल", "बंद", "बन्द",
+            "ऑफ", "क्लोज", "क्लोज़", "क्लोस"
         )
         val showWords = setOf(
             "show", "open", "kholo", "khol", "dikhao", "dikha", "list", "batao",
@@ -1436,8 +1840,12 @@ class MainActivity : Activity() {
         val lower = raw.lowercase()
         val words = wordSet(raw)
         val hasMedia = words.any {
-            it in setOf("song", "songs", "gana", "gane", "gaana", "music", "track", "audio")
-        } || lower.contains("संगीत") || lower.contains("गाना")
+            it in setOf(
+                "song", "songs", "gana", "gane", "gaana", "music", "track", "audio",
+                "playback"
+            )
+        } || lower.contains("संगीत") || lower.contains("गाना") ||
+            lower.contains("प्लेबैक")
         val next = words.any {
             it in setOf("next", "agla", "agle", "skip", "aage", "अगला", "अगले")
         }
@@ -1452,9 +1860,11 @@ class MainActivity : Activity() {
         }
         val play = words.any {
             it in setOf("play", "resume", "chalao", "chala", "bajao", "baja", "चलाओ", "चला", "बजाओ", "बजा")
-        }
+        } || (hasMedia && (
+            words.any { it in setOf("start", "shuru", "स्टार्ट", "शुरू") } ||
+                lower.contains("playback") || lower.contains("प्लेबैक")
+            ))
         val stop = words.any { it in setOf("stop") }
-        if ((next || previous) && !hasMedia) return false
         val action = when {
             next -> "next"
             previous -> "previous"
@@ -1463,7 +1873,9 @@ class MainActivity : Activity() {
             play -> "play"
             else -> return false
         }
-        if (!hasMedia && action != "pause" && action != "play") return false
+        if (!hasMedia && action != "pause" && action != "play" &&
+            action != "next" && action != "previous" && action != "stop"
+        ) return false
         Diagnostics.log("DEVICE", "media action=$action hasMedia=$hasMedia")
         beginSilentTurn()
         toast(DeviceController.mediaControl(this, action))
@@ -1475,12 +1887,13 @@ class MainActivity : Activity() {
         val words = wordSet(raw)
         val isVolume = words.contains("volume") || words.contains("awaaz") ||
             words.contains("sound") || lower.contains("वॉल्यूम") ||
+            lower.contains("वाल्यूम") || lower.contains("वॉलुम") ||
             lower.contains("आवाज") || lower.contains("आवाज़")
         if (!isVolume) return false
         var percent = Regex("(\\d{1,3})\\s*%?").find(raw)
             ?.groupValues?.getOrNull(1)?.toIntOrNull()
             ?.takeIf { it in 0..100 }
-        if (words.any { it in setOf("full", "max", "maximum") }) {
+        if (words.any { it in setOf("full", "max", "maximum", "मैक्स", "फुल", "पूरा") }) {
             percent = 100
         }
         if (percent != null) {
@@ -1492,7 +1905,7 @@ class MainActivity : Activity() {
         val up = words.any {
             it in setOf(
                 "up", "badhao", "badha", "increase", "tez", "high",
-                "बढ़ाओ", "बढ़ा", "तेज़", "तेज"
+                "ज़्यादा", "ज्यादा", "अधिक", "तेज़", "तेज", "बढ़ाओ", "बढ़ा"
             )
         }
         val down = words.any {
@@ -1525,6 +1938,10 @@ class MainActivity : Activity() {
 
     private fun scheduleVoiceReminder(text: String) {
         if (!VoiceReminderParser.hasTrigger(text)) return
+        if (suppressVoiceCommand(text)) {
+            Diagnostics.log("REMINDER", "skip echo/playback '${text.take(160)}'")
+            return
+        }
         lastReminderIntentAt = SystemClock.elapsedRealtime()
         pendingReminderText = text
         reminderHandler.removeCallbacks(parsePendingReminder)
@@ -1653,6 +2070,7 @@ class MainActivity : Activity() {
     }
 
     private fun onReminderCreationFailed() {
+        Diagnostics.log("REMINDER", "creation failed")
         reminderFinalPending = false
         reminderFinalScheduled = false
         reminderHandler.removeCallbacks(reminderFinalRunnable)
@@ -1684,6 +2102,10 @@ class MainActivity : Activity() {
 
     private fun handleVoiceReminder(raw: String): Boolean {
         val parsed = VoiceReminderParser.parse(raw) ?: return false
+        Diagnostics.log(
+            "REMINDER",
+            "parsed at=${parsed.atMillis} title='${parsed.title.take(80)}'"
+        )
         val now = SystemClock.elapsedRealtime()
         lastReminderIntentAt = now
         val previousRaw = lastReminderRawText
@@ -1734,6 +2156,7 @@ class MainActivity : Activity() {
             return true
         }
         ReminderScheduler.schedule(applicationContext, note)
+        Diagnostics.log("REMINDER", "scheduled id=$id at=${parsed.atMillis}")
         onReminderCreated(id)
         return true
     }
@@ -1949,6 +2372,8 @@ class MainActivity : Activity() {
                 toast("Configuration saved")
             }, {
                 checkForUpdates(manual = true)
+            }, {
+                requestAssistantRole()
             })
         }
     }
@@ -2148,6 +2573,8 @@ class MainActivity : Activity() {
             Diagnostics.log("ASR", "output len=${text.length} text='${text.take(180)}'")
             ChatStore.appendModel(text)
             assistantTurnText.append(text)
+            lastAssistantOutput = (lastAssistantOutput + " " + text).takeLast(1200)
+            lastAssistantOutputAt = SystemClock.elapsedRealtime()
             if (reminderAckAwaiting && !reminderAckDone) {
                 val turn = assistantTurnText.toString().lowercase()
                 if (turn.contains("reminder set ho raha") ||
@@ -2197,6 +2624,7 @@ class MainActivity : Activity() {
 
         override fun onInterrupted() {
             Diagnostics.log("LIVE", "onInterrupted")
+            lastInterruptedAt = SystemClock.elapsedRealtime()
             audio?.interrupt()
             if (reminderAckAwaiting && !reminderAckDone) finishReminderAck()
             ChatStore.interrupted()
@@ -2212,6 +2640,12 @@ class MainActivity : Activity() {
 
         override fun onVoiceActivity(active: Boolean) {
             Diagnostics.log("LIVE", "onVoiceActivity active=$active")
+            if (active) {
+                cancelVoiceFinalize()
+                lastHandledVoiceText = ""
+            } else {
+                scheduleVoiceFinalize()
+            }
             if (active && this@MainActivity.active) {
                 orb.mode = OrbView.Mode.LISTENING
                 orb.setLevel(0.5f)
@@ -2232,6 +2666,14 @@ class MainActivity : Activity() {
         }
 
         override fun onDeviceAction(name: String, args: JSONObject, id: String) {
+            if (name == "start_lesson" || name == "show_word" ||
+                name == "save_progress" || name == "close_lesson"
+            ) {
+                val result = handleLearningTool(name, args)
+                Diagnostics.log("LEARN", "$name result='${result.take(160)}'")
+                client?.respondToDevice(id, name, result)
+                return
+            }
             Diagnostics.log("LIVE", "deviceAction name=$name args=${args.toString().take(180)}")
             beginSilentTurn()
             val result = try {
@@ -2298,6 +2740,16 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQUEST_PERMISSIONS = 701
+        private const val REQUEST_ASSISTANT_ROLE = 702
+        private val MEDIA_TRIGGER_KEYS = setOf(
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+            KeyEvent.KEYCODE_MEDIA_PLAY,
+            KeyEvent.KEYCODE_MEDIA_PAUSE,
+            KeyEvent.KEYCODE_MEDIA_STOP,
+            KeyEvent.KEYCODE_MEDIA_NEXT,
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+            KeyEvent.KEYCODE_HEADSETHOOK
+        )
         private const val MUTE_DETAIL = "Microphone off — say \"Hey Jarvis\" to unmute"
         private const val APP_CONTROL_INSTRUCTION =
             "You control this app through the provided functions. You MUST call the matching " +
@@ -2329,6 +2781,28 @@ class MainActivity : Activity() {
                 "search in the browser. After a device function, keep your reply to at most one " +
                 "short sentence. Never claim an action succeeded if the tool result reports failure."
 
+        private const val LANGUAGE_TUTOR_INSTRUCTION =
+            "LANGUAGE TUTOR MODE: You can teach Bengali, French and Russian from scratch, step " +
+                "by step. When the user asks to learn, start or continue a language, you MUST " +
+                "call start_lesson with that language. The tool returns the learner's saved " +
+                "progress; continue from the exact next lesson. For every new word call " +
+                "show_word with the native script, transliteration and Hindi meaning so it " +
+                "appears large on screen, then say the word slowly twice and use it in one short " +
+                "example. Teach 5 new words per lesson, then revise and run a short friendly " +
+                "quiz. Keep sentences short, speak slowly and correct gently. After the lesson " +
+                "call save_progress with the lesson number, summary, weak words and next plan. " +
+                "If the user says 'close lesson' or 'lesson band karo', call close_lesson. Never " +
+                "refuse, never switch language unless asked, and never claim you cannot teach."
+
+        private const val MEDIA_CONTROL_INSTRUCTION =
+            "MEDIA PLAYBACK: You CAN start, resume, pause, stop and skip media playback. The app " +
+                "performs these actions locally and silently, including for Spotify, YouTube " +
+                "Music and other players. Never say you cannot control media playback, never " +
+                "tell the user to use the phone's controls, and never ask for extra permission. " +
+                "If the user names an app and asks for playback, you may open that app with " +
+                "open_app first; the app will then send the play action. Never address the user " +
+                "as 'sir'."
+
         private const val SYSTEM_CLOCK_INSTRUCTION =
             "ALARMS AND TIMERS: The word 'alarm' always means the phone's Clock app alarm, " +
                 "never a Jarvis reminder. The app sets and deletes alarms and timers locally " +
@@ -2348,6 +2822,15 @@ class MainActivity : Activity() {
                 "question, making conversation, or the intent is not a clear control command, do " +
                 "NOT call any control function and answer normally with your voice. Never repeat " +
                 "or summarise a control action."
+
+        private const val CAPABILITY_LIMITS_INSTRUCTION =
+            "CAPABILITY LIMITS: You cannot make phone calls, send SMS or messages, or read, " +
+                "search or edit the phone's contacts. The app has no contacts access and no call " +
+                "or SMS function. Never say you can manage calls, messages or contacts. If the " +
+                "user asks, say clearly that this is not available yet and suggest using the " +
+                "phone's Phone/Dialer or Contacts app. You CAN open installed apps when asked " +
+                "(open_app), including the Phone/Dialer app, but you cannot place a call or pick " +
+                "a contact for the user."
 
         private val QUESTION_WORDS = setOf(
             "kya", "kaise", "kaun", "kab", "kahan", "kaha", "kyu", "kyun", "kitna",

@@ -11,6 +11,7 @@ import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.provider.Settings
+import android.telecom.TelecomManager
 import android.view.KeyEvent
 import org.json.JSONObject
 import kotlin.math.roundToInt
@@ -42,6 +43,7 @@ object DeviceController {
         listOf("spotify") to "com.spotify.music",
         listOf("netflix") to "com.netflix.mediaclient",
         listOf("dialer", "phone app") to "com.google.android.dialer",
+        listOf("contacts", "contact", "संपर्क", "कॉन्टैक्ट") to "com.google.android.contacts",
         listOf("camera", "कैमरा") to "com.android.camera",
         listOf("calculator", "calc") to "com.google.android.calculator",
         listOf("messages", "sms") to "com.google.android.apps.messaging"
@@ -58,6 +60,10 @@ object DeviceController {
         }
 
         val pm = context.packageManager
+
+        if (query in setOf("phone", "dialer", "call", "फोन", "डायलर", "कॉल")) {
+            return openDialer(context, pm, appName)
+        }
 
         if (query.contains('.')) {
             launchPackage(context, pm, query, appName)?.let { return it }
@@ -82,8 +88,8 @@ object DeviceController {
             val score = when {
                 label == query || pkg == query -> 100
                 label.startsWith(query) || pkg.startsWith(query) -> 80
-                label.contains(query) || pkg.contains(query) -> 60
-                query.contains(label) && label.length >= 3 -> 50
+                label.contains(query) -> 60
+                query.length >= 4 && query.contains(label) && label.length >= 4 -> 50
                 else -> 0
             }
             if (score > bestScore) {
@@ -104,6 +110,54 @@ object DeviceController {
             "Opened $label."
         } catch (t: Throwable) {
             "Could not open $label: ${t.message}"
+        }
+    }
+
+    private fun openDialer(
+        context: Context,
+        pm: android.content.pm.PackageManager,
+        requested: String
+    ): String {
+        val candidates = mutableListOf<String>()
+        try {
+            val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+            telecom?.defaultDialerPackage?.takeIf { it.isNotBlank() }?.let { candidates.add(it) }
+        } catch (_: Throwable) {
+        }
+        val dialIntent = Intent(Intent.ACTION_DIAL).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            dialIntent.resolveActivity(pm)?.packageName?.let { candidates.add(it) }
+        } catch (_: Throwable) {
+        }
+        candidates.addAll(
+            listOf(
+                "com.google.android.dialer",
+                "com.android.phone",
+                "com.xiaomi.phone",
+                "com.android.dialer"
+            )
+        )
+        for (pkg in candidates.distinct()) {
+            val intent = pm.getLaunchIntentForPackage(pkg) ?: continue
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            try {
+                context.startActivity(intent)
+                Diagnostics.log("DEVICE", "opened dialer pkg=$pkg")
+                val label = try {
+                    pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+                } catch (_: Throwable) {
+                    requested
+                }
+                return "Opened $label."
+            } catch (_: Throwable) {
+            }
+        }
+        return try {
+            context.startActivity(dialIntent)
+            Diagnostics.log("DEVICE", "opened dialer via ACTION_DIAL")
+            "Opened dialer."
+        } catch (t: Throwable) {
+            "Could not open the dialer: ${t.message ?: "not available"}"
         }
     }
 

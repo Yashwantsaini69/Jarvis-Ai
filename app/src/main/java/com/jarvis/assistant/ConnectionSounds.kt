@@ -14,6 +14,17 @@ object ConnectionSounds {
     fun playConnected() = play(renderTone(rising = true))
     fun playDisconnected() = play(renderTone(rising = false))
 
+    fun playListening() {
+        val freq = 988.0
+        val count = (SAMPLE_RATE * 0.07).toInt()
+        val out = ShortArray(count) { i ->
+            val t = i.toDouble() / SAMPLE_RATE
+            val sample = sin(2.0 * PI * freq * t) * envelope(i, count) * AMPLITUDE
+            (sample * Short.MAX_VALUE).toInt().toShort()
+        }
+        play(out)
+    }
+
     private fun play(samples: ShortArray) {
         Thread({
             try {

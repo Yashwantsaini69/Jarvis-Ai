@@ -14,6 +14,8 @@ import android.view.View
 import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.random.Random
 
 class OrbView @JvmOverloads constructor(
     context: Context,
@@ -31,9 +33,42 @@ class OrbView @JvmOverloads constructor(
 
     var orbStyle: Int = 0
         set(value) {
-            field = value.coerceIn(0, 4)
+            field = value.coerceIn(0, 5)
             invalidate()
         }
+
+    private val particleX = FloatArray(620)
+    private val particleY = FloatArray(620)
+    private val particleZ = FloatArray(620)
+    private val rimAngle = FloatArray(220)
+    private val rimPhase = FloatArray(220)
+    private val rimJitter = FloatArray(220)
+    private val sparkAngle = FloatArray(32)
+    private val sparkRadius = FloatArray(32)
+    private val sparkPhase = FloatArray(32)
+
+    init {
+        val goldenAngle = (Math.PI * (3.0 - Math.sqrt(5.0))).toFloat()
+        for (i in particleX.indices) {
+            val z = 1f - 2f * (i + 0.5f) / particleX.size
+            val r = sqrt((1f - z * z).coerceAtLeast(0f))
+            val theta = i * goldenAngle
+            particleX[i] = r * cos(theta)
+            particleY[i] = z
+            particleZ[i] = r * sin(theta)
+        }
+        val random = Random(2026)
+        for (i in rimAngle.indices) {
+            rimAngle[i] = random.nextFloat() * 6.2831855f
+            rimPhase[i] = random.nextFloat()
+            rimJitter[i] = random.nextFloat() - 0.5f
+        }
+        for (i in sparkAngle.indices) {
+            sparkAngle[i] = random.nextFloat() * 6.2831855f
+            sparkRadius[i] = sqrt(random.nextFloat()) * 0.9f
+            sparkPhase[i] = random.nextFloat() * 6.2831855f
+        }
+    }
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val path = Path()
@@ -70,7 +105,8 @@ class OrbView @JvmOverloads constructor(
             1 -> drawPlasmaSphere(canvas, cx, cy, radius, t, e, accent)
             2 -> drawEnergyCore(canvas, cx, cy, radius, t, e, accent)
             3 -> drawNeuralSphere(canvas, cx, cy, radius, t, e, accent)
-            else -> drawPulsar(canvas, cx, cy, radius, t, e, accent)
+            4 -> drawPulsar(canvas, cx, cy, radius, t, e, accent)
+            else -> drawParticleSphere(canvas, cx, cy, radius, t, e, accent)
         }
 
         postInvalidateOnAnimation()
@@ -451,6 +487,112 @@ class OrbView @JvmOverloads constructor(
         canvas.drawCircle(cx, cy, radius * 0.99f, paint)
 
         drawCore(canvas, cx, cy, radius * 0.11f, e, accent, Palette.ice)
+    }
+
+    private fun drawParticleSphere(
+        canvas: Canvas,
+        cx: Float,
+        cy: Float,
+        radius: Float,
+        t: Float,
+        e: Float,
+        accent: Int
+    ) {
+        val dense = width >= context.dp(200f)
+        val interiorCount = if (dense) particleX.size else 220
+        val rimCount = if (dense) rimAngle.size else 90
+        val sparkCount = if (dense) sparkAngle.size else 12
+
+        paint.style = Paint.Style.FILL
+        paint.shader = RadialGradient(
+            cx, cy, radius * 1.02f,
+            intArrayOf(
+                withAlpha(Color.BLACK, 0.55f),
+                withAlpha(Color.BLACK, 0.45f),
+                Color.TRANSPARENT
+            ),
+            floatArrayOf(0f, 0.72f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawCircle(cx, cy, radius * 1.02f, paint)
+        paint.shader = null
+
+        paint.shader = RadialGradient(
+            cx, cy, radius * 1.14f,
+            intArrayOf(
+                Color.TRANSPARENT,
+                Color.TRANSPARENT,
+                withAlpha(Palette.ice, 0.16f * e),
+                withAlpha(accent, 0.10f * e),
+                Color.TRANSPARENT
+            ),
+            floatArrayOf(0f, 0.70f, 0.90f, 0.97f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawCircle(cx, cy, radius * 1.14f, paint)
+        paint.shader = null
+
+        val rotY = t * 0.32f
+        val rotX = sin(t * 0.21f) * 0.25f
+        val cosY = cos(rotY)
+        val sinY = sin(rotY)
+        val cosX = cos(rotX)
+        val sinX = sin(rotX)
+
+        for (i in 0 until interiorCount) {
+            val x = particleX[i]
+            val y = particleY[i]
+            val z = particleZ[i]
+            val x1 = x * cosY - z * sinY
+            val z1 = x * sinY + z * cosY
+            val y2 = y * cosX - z1 * sinX
+            val z2 = y * sinX + z1 * cosX
+            val rr = sqrt(x1 * x1 + y2 * y2).coerceIn(0f, 1f)
+            val front = (z2 + 1f) * 0.5f
+            val rim = smoothstep(0.58f, 0.98f, rr)
+            val alpha = ((0.035f + 0.18f * front + 0.42f * rim) * e)
+                .coerceIn(0f, 0.92f)
+            val size = radius * (0.0055f + 0.008f * rim) * (0.75f + 0.5f * front)
+            paint.color = withAlpha(
+                if (rim > 0.45f) blend(Palette.ice, accent, 0.35f) else Palette.ice,
+                alpha
+            )
+            canvas.drawCircle(cx + x1 * radius, cy + y2 * radius, size, paint)
+        }
+
+        for (i in 0 until rimCount) {
+            val angle = rimAngle[i]
+            val wave = 0.5f + 0.5f * sin(angle * 4.2f + t * 1.6f + rimPhase[i] * 6.28f)
+            val wave2 = 0.5f + 0.5f * sin(angle * 11f - t * 2.3f + rimPhase[i] * 3.1f)
+            val rr = radius * (0.90f + 0.075f * wave + 0.018f * wave2)
+            val jitter = rimJitter[i] * radius * 0.012f
+            val px = cx + cos(angle) * rr + jitter
+            val py = cy + sin(angle) * rr - jitter
+            val alpha = ((0.18f + 0.72f * wave * wave) * e).coerceIn(0f, 0.95f)
+            val size = radius * (0.007f + 0.009f * wave2)
+            paint.color = withAlpha(
+                blend(Palette.ice, accent, 0.18f + 0.22f * wave2),
+                alpha
+            )
+            canvas.drawCircle(px, py, size, paint)
+        }
+
+        for (i in 0 until sparkCount) {
+            val flicker = 0.5f + 0.5f * sin(t * 3.1f + sparkPhase[i])
+            val rr = sparkRadius[i] * radius
+            val angle = sparkAngle[i] + t * 0.06f
+            val px = cx + cos(angle) * rr
+            val py = cy + sin(angle) * rr
+            val alpha = ((0.18f + 0.7f * flicker) * e).coerceIn(0f, 0.95f)
+            val size = radius * (0.004f + 0.006f * flicker)
+            paint.color = withAlpha(Palette.ice, alpha)
+            canvas.drawCircle(px, py, size, paint)
+        }
+    }
+
+    private fun smoothstep(edge0: Float, edge1: Float, x: Float): Float {
+        val v = ((x - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
+        return v * v * (3f - 2f * v)
     }
 
     private fun drawPulsar(canvas: Canvas, cx: Float, cy: Float, radius: Float, t: Float, e: Float, accent: Int) {

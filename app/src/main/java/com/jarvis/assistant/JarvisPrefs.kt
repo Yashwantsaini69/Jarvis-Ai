@@ -33,7 +33,14 @@ object JarvisPrefs {
         "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat"
     )
 
-    val orbStyles = listOf("Arc Reactor", "Plasma Sphere", "Energy Core", "Neural Sphere", "Pulsar")
+    val orbStyles = listOf(
+        "Arc Reactor",
+        "Plasma Sphere",
+        "Energy Core",
+        "Neural Sphere",
+        "Pulsar",
+        "Particle Sphere"
+    )
 
     private const val LEGACY_DEFAULT_INSTRUCTION =
         "You are JARVIS, the witty, calm and ultra-capable AI assistant from Iron Man. " +

@@ -1,3 +1,151 @@
+JARVIS AI 3.45 (last update) — Particle Sphere orb
+
+- New orb design: a dense rotating particle sphere with a bright, noisy rim,
+  soft glow and flickering sparkles.
+- Pick it in Settings > ORB DESIGN > PARTICLE SPHERE.
+
+HOW TO USE THIS UPDATE
+1. Install this APK over the old Jarvis (same signing key).
+2. Open Jarvis Settings.
+3. Go to ORB DESIGN and select PARTICLE SPHERE.
+4. Save the configuration.
+
+JARVIS AI 3.44 — About stats
+
+- About screen now shows TOTAL DOWNLOADS and RATING.
+- Values are static placeholders (10,000+ and 4.8★), not live tracking.
+
+JARVIS AI 3.43 — About screen
+
+- ABOUT ME opens a full-screen manager-style About screen.
+- Added the intro from Yashwant Saini.
+- No audio or video in About.
+
+JARVIS AI 3.42 — Settings cleanup + About Me
+
+- Removed the extra explanation lines and the footer from Settings.
+  All controls and features are unchanged.
+- New ABOUT ME long bar above SAVE CONFIGURATION.
+- Tap it to expand: plays res/raw/about_audio and shows a small muted,
+  looping video player for res/raw/about_video.
+- About text, audio and video will be added when supplied.
+
+JARVIS AI 3.41 — Language Tutor Mode
+
+- Learn Bengali, French or Russian from scratch, step by step.
+- Say "French sikhao", "Bengali sikhao", "Russian sikhao" or "continue French".
+- Big on-screen card: native script, transliteration, meaning, example.
+- REPEAT, SLOWER and CLOSE buttons on screen.
+- 5 new words per lesson, revision and a short quiz.
+- Progress saved per language; later sessions resume from the next lesson.
+- Includes v3.40 media playback fix and v3.39 earbud fixes.
+
+HOW TO USE
+1. Update and open Jarvis (start the session).
+2. Say "French sikhao" (or Bengali/Russian). Wait for the card.
+3. Repeat words with Jarvis; use REPEAT/SLOWER or say "repeat".
+4. Say "close lesson" or press CLOSE to stop. Progress is saved.
+
+JARVIS AI 3.40 — Media playback fix
+
+- "Spotify Playback start karo", "gana chalao" and similar commands now start
+  playback instead of refusing.
+- Jarvis no longer claims it cannot control media or tells you to use phone
+  controls.
+- Duplicate tool calls within 1.5 seconds are ignored (no repeated app opens).
+- Includes earbud media button trigger, earbud mic (SCO) and echo fixes.
+
+HOW TO USE
+1. Start Jarvis, then say "Spotify playback start karo" or "gana chalao".
+2. Earbuds: connect, lock the phone, press the earbud button, wait for chime.
+3. If a command fails, export DIAGNOSTICS and check [DEVICE]/[MEDIA] lines.
+
+JARVIS AI 3.39 — Earbud media button
+
+- While Jarvis is connected and the app is in the background (phone locked in
+  your pocket), press the earbud button to open Jarvis and start listening.
+  Works with play/pause, headset hook, next and previous keys.
+- If Jarvis is speaking, the same press stops its speech and plays the chime.
+- In the foreground, media buttons are released back to music apps, so music
+  controls keep working normally.
+- If earbuds are connected but SCO is missing, the app now requests HFP and
+  retries routing to the earbud mic for about 1.2 seconds.
+
+HOW TO USE
+1. Connect earbuds, start Jarvis once, then lock the phone / put it in pocket.
+2. Press the earbud button once. Wait for the chime, then speak.
+3. Press again while Jarvis is talking to stop it.
+4. If it does not trigger, check DIAGNOSTICS for [MEDIA] and SCO recheck lines.
+
+JARVIS AI 3.38 — Echo and assist diagnostics
+
+- Fixed voice commands being swallowed while Jarvis is speaking. Commands
+  like "pause karo", "next karo" and "music pause" now run immediately and
+  stop Jarvis (barge-in).
+- Echo filter is stricter: only near-verbatim repeats of Jarvis's own words
+  are ignored, so real questions/commands are no longer skipped.
+- Added launch-intent and Bluetooth audio-device logging to diagnostics, so
+  we can see what the earbud long-press sends and whether A2DP/HFP/SCO is up.
+- Single-task launch: the assistant reuses the running session instead of
+  recreating it.
+
+JARVIS AI 3.37 — Assistant setup fix
+
+- "Assistant role not granted" fixed. Android does not allow granting the
+  assistant role with a one-tap dialog. SET AS DEFAULT ASSISTANT now opens
+  the system "digital assistant app" picker so you can choose Jarvis.
+- After you return, the app checks whether Jarvis is really selected.
+- If Jarvis is not in the list, update the phone's system webview/assistant
+  settings or set it manually: Settings > Apps > Default apps >
+  Digital assistant app > Jarvis.
+
+JARVIS AI 3.36 — Earbud assist
+
+EARBUD LONG-PRESS (POCKET MODE)
+- Set Jarvis as your default assistant once: Settings > SET AS DEFAULT ASSISTANT.
+- Long-press your earbud (the voice-assistant gesture) to open Jarvis and
+  start listening. Works with the phone locked and in your pocket.
+- A short chime and a vibration confirm the trigger. If the screen is off,
+  Jarvis returns to the background and keeps listening.
+- Earbud microphone is used when Bluetooth earbuds are connected (SCO).
+- Bluetooth permission is requested once. No call, SMS or contacts access.
+
+HOW TO USE THIS UPDATE
+1. Install over the old Jarvis.
+2. Open Settings > SET AS DEFAULT ASSISTANT > Allow.
+3. Connect your earbuds and lock the phone.
+4. Long-press the earbud, wait for the chime, then speak.
+5. If the earbud does not send the assistant key, use the app or the media
+   controls instead. Behaviour depends on the earbud model (boAt/Mivi/Realme).
+
+JARVIS AI 3.35 — Voice fixes
+
+VOICE RELIABILITY
+- Commands run as soon as you stop speaking. The app no longer waits for a
+  final transcript marker that Gemini never sends, so replies feel faster.
+- Echo fix: Jarvis no longer hears its own reply as a command. Acoustic echo
+  cancellation is enabled and echo text is filtered out.
+- Voice interrupt still works: you can talk over Jarvis to stop it.
+
+COMMANDS
+- Media: "next", "agla", "previous", "pichla" and "stop" work without saying
+  song/music.
+- Alarm: "alarm band/close/क्लोज करो" now dismisses instead of re-setting.
+- Volume in Hindi: "वॉल्यूम मैक्स करो", "ज़्यादा", "कम", "म्यूट".
+- "Phone"/"Dialer"/"फोन" opens the real Phone app (no more Mi Remote mix-up).
+- Unmute detector is stricter, so the mic is less likely to turn on by itself.
+
+HONESTY
+- Jarvis no longer claims it can make calls, send SMS or read/search contacts.
+  Those are not available yet. It can still open the Phone/Contacts app.
+
+HOW TO USE THIS UPDATE
+1. Install this APK over the old Jarvis (same signing key).
+2. Open Jarvis and start the live session.
+3. Say "next", "agla", "alarm band karo", "वॉल्यूम मैक्स करो".
+4. Say "phone kholo" to open the dialer.
+5. If you speak while Jarvis is talking, it should stop and listen.
+
 JARVIS AI 3.33.2-diag — Voice diagnostics
 
 DIAGNOSTIC BUILD
