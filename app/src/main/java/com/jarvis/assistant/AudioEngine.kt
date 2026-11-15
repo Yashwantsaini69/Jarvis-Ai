@@ -25,9 +25,13 @@ class AudioEngine(
 
     fun startCapture(): Boolean {
         if (capturing) return true
+        Diagnostics.log("AUDIO", "startCapture requested")
         val audioRecord = createRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
             ?: createRecord(MediaRecorder.AudioSource.MIC)
-            ?: return false
+            ?: run {
+                Diagnostics.log("AUDIO", "startCapture failed: no usable AudioRecord")
+                return false
+            }
         return try {
             audioRecord.startRecording()
             record = audioRecord
@@ -36,9 +40,11 @@ class AudioEngine(
                 priority = Thread.MAX_PRIORITY
                 start()
             }
+            Diagnostics.log("AUDIO", "recording started")
             true
         } catch (t: Throwable) {
             Log.w("JarvisAudio", "microphone start failed", t)
+            Diagnostics.log("AUDIO", "startRecording failed: ${t.message ?: t.javaClass.simpleName}")
             try {
                 audioRecord.release()
             } catch (_: Throwable) {
@@ -48,6 +54,7 @@ class AudioEngine(
     }
 
     fun stopCapture() {
+        if (capturing) Diagnostics.log("AUDIO", "stopCapture")
         capturing = false
         val current = record
         record = null
@@ -82,12 +89,17 @@ class AudioEngine(
     }
 
     private fun createRecord(source: Int): AudioRecord? {
+        val sourceName = sourceName(source)
+        Diagnostics.log("AUDIO", "trying $sourceName 16000 mono pcm16")
         val minBuffer = AudioRecord.getMinBufferSize(
             16000,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-        if (minBuffer <= 0) return null
+        if (minBuffer <= 0) {
+            Diagnostics.log("AUDIO", "$sourceName minBuffer=$minBuffer")
+            return null
+        }
         val bufferSize = max(minBuffer * 2, 6400)
         return try {
             val created = AudioRecord(
@@ -98,33 +110,51 @@ class AudioEngine(
                 bufferSize
             )
             if (created.state == AudioRecord.STATE_INITIALIZED) {
+                Diagnostics.log("AUDIO", "$sourceName initialized buffer=$bufferSize")
+                Diagnostics.setMicSource("$sourceName/16000/mono/pcm16")
                 created
             } else {
+                Diagnostics.log("AUDIO", "$sourceName not initialized state=${created.state}")
                 created.release()
                 null
             }
         } catch (t: Throwable) {
             Log.w("JarvisAudio", "AudioRecord create failed", t)
+            Diagnostics.log("AUDIO", "$sourceName create failed: ${t.message ?: t.javaClass.simpleName}")
             null
         }
     }
 
+    private fun sourceName(source: Int): String = when (source) {
+        MediaRecorder.AudioSource.VOICE_COMMUNICATION -> "VOICE_COMMUNICATION"
+        MediaRecorder.AudioSource.MIC -> "MIC"
+        else -> "source#$source"
+    }
+
     private fun captureLoop(audioRecord: AudioRecord) {
         val buffer = ByteArray(3200)
+        var loggedFirst = false
         while (capturing) {
             val read = try {
                 audioRecord.read(buffer, 0, buffer.size)
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
+                Diagnostics.log("AUDIO", "read threw ${t.message ?: t.javaClass.simpleName}")
                 -1
             }
             if (read > 0) {
+                if (!loggedFirst) {
+                    loggedFirst = true
+                    Diagnostics.log("AUDIO", "first read bytes=$read")
+                }
                 val chunk = buffer.copyOf(read)
                 onMicChunk(chunk)
                 onMicLevel(levelOf(chunk))
             } else if (read < 0) {
+                if (capturing) Diagnostics.log("AUDIO", "read error=$read")
                 break
             }
         }
+        Diagnostics.log("AUDIO", "capture loop ended")
     }
 
     private class Playback(private val onLevel: (Float) -> Unit) {

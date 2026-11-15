@@ -35,9 +35,9 @@ object VoiceReminderParser {
     }
 
     internal val triggerWords = setOf(
-        "reminder", "reminders", "remind", "alarm", "alert",
+        "reminder", "reminders", "remind", "alert",
         "wake", "wakeup", "uthana", "uthna", "jagana", "jagna", "jaga",
-        "रिमाइंडर", "अलार्म", "एलर्ट", "उठाना", "उठना", "जगाना"
+        "रिमाइंडर", "एलर्ट", "उठाना", "उठना", "जगाना"
     )
 
     internal val clockWords = setOf("baje", "baj", "oclock", "o'clock", "बजे")
@@ -89,6 +89,26 @@ object VoiceReminderParser {
         "घंटा" to 3600L, "घंटे" to 3600L
     )
 
+    private val numberWords: Map<String, Int> = mapOf(
+        "zero" to 0, "one" to 1, "ek" to 1, "एक" to 1,
+        "two" to 2, "do" to 2, "दो" to 2,
+        "three" to 3, "teen" to 3, "तीन" to 3,
+        "four" to 4, "char" to 4, "chaar" to 4, "चार" to 4,
+        "five" to 5, "paanch" to 5, "panch" to 5, "पांच" to 5,
+        "six" to 6, "chhah" to 6, "chhe" to 6, "छह" to 6,
+        "seven" to 7, "saat" to 7, "सात" to 7,
+        "eight" to 8, "aath" to 8, "आठ" to 8,
+        "nine" to 9, "nau" to 9, "नौ" to 9,
+        "ten" to 10, "das" to 10, "दस" to 10,
+        "eleven" to 11, "gyarah" to 11, "ग्यारह" to 11,
+        "twelve" to 12, "barah" to 12, "बारह" to 12,
+        "fifteen" to 15, "pandrah" to 15, "पंद्रह" to 15,
+        "twenty" to 20, "bees" to 20, "बीस" to 20,
+        "thirty" to 30, "tees" to 30, "तीस" to 30,
+        "forty" to 40, "chalis" to 40, "चालीस" to 40,
+        "fifty" to 50, "pachas" to 50, "पचास" to 50
+    )
+
     internal val fillerWords = setOf(
         "please", "pls", "plz", "me", "to", "at", "on", "for", "set", "lagao",
         "lagana", "lagado", "laga", "lag", "kar", "karo", "kardo", "do", "de",
@@ -96,6 +116,7 @@ object VoiceReminderParser {
         "ka", "ke", "ki", "liye", "liy", "of",
         "pe", "par", "ko", "se", "tak", "time", "dena", "deni", "dunga", "dungi",
         "denge", "dilana", "yaad", "dila", "dilao", "dilado", "in", "up",
+        "alarm", "अलार्म",
         "remind", "मुझे", "मेरा", "मेरी", "का", "के", "की", "लिए", "याद", "दिला",
         "दिलाओ", "लगाओ", "करो", "कर", "दो", "सेट", "पे", "पर", "को", "से", "तक",
         "समय", "देना", "दूंगा", "दूंगी"
@@ -121,6 +142,23 @@ object VoiceReminderParser {
             clarificationQuestion = resolution.clarificationQuestion,
             corrected = resolution.hasCorrection
         )
+    }
+
+    fun parseTimeOnly(raw: String, now: Long = System.currentTimeMillis()): Long? {
+        val tokens = tokenize(normalizeNumberWords(raw))
+        val used = mutableSetOf<Int>()
+        return parseRelative(tokens, used, now) ?: parseClock(tokens, used, now)
+    }
+
+    fun normalizeNumberWords(raw: String): String {
+        var result = raw.lowercase()
+        for ((word, value) in numberWords) {
+            result = result.replace(
+                Regex("(?<![\\p{L}\\p{M}])$word(?![\\p{L}\\p{M}])"),
+                value.toString()
+            )
+        }
+        return result
     }
 
     private fun parseLegacy(raw: String, now: Long): Parsed? {

@@ -2,9 +2,12 @@ package com.jarvis.assistant
 
 import android.app.AlertDialog
 import android.app.Dialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -71,12 +74,34 @@ class SettingsDialog(
         - "Bluetooth on karo" or "WiFi band karo". Android may open a system panel.
         - These commands run silently, without a spoken reply.
 
+        ALARMS AND TIMERS (PHONE CLOCK)
+        - "Alarm 7 baje lagao" sets the phone's Clock alarm.
+        - "Alarm" always means the phone alarm. It never creates a Jarvis reminder.
+        - "Alarm band karo" dismisses the next alarm. Add a time to target one.
+        - "Alarms dikhao" opens the Clock alarms screen.
+        - "10 minute ka timer" starts a Clock timer.
+        - "Timer band karo" opens the Clock timers screen.
+        - "Reminder" or "yaad dila" still create Jarvis reminders.
+
+        DEVICE CONTROLS
+        - "Flashlight on" or "flashlight off".
+        - "Play", "pause", "next song", "previous song" control the active
+          music player, including the notification panel.
+        - "Volume up", "volume down", "volume 50%", "mute".
+        - These commands run silently.
+
         REMINDERS
         - "Reminder set karo 5 baje", "reminder tomorrow 9 am",
           "reminder 16 nov 1 am".
         - English, Hindi and Hinglish are supported.
-        - Jarvis saves the reminder, sets an alarm, and confirms naturally.
+        - Jarvis saves the reminder and notifies you at the right time.
         - Reminders are restored after a restart.
+
+        DELETE
+        - "Last reminder delete karo" or "meeting wala reminder delete karo".
+        - "Note delete karo shopping".
+        - "Sab reminders delete karo" asks for confirmation first.
+        - The notepad DELETE button also works.
 
         MEMORY
         - Jarvis remembers useful facts about you over time.
@@ -192,6 +217,30 @@ class SettingsDialog(
             setOnClickListener { onCheckUpdates() }
         }
         content.addView(checkUpdates, matchWrap().apply { topMargin = context.dp(8f) })
+
+        val diagnostics = TextView(context).apply {
+            text = "DIAGNOSTICS"
+            textSize = 10.5f
+            letterSpacing = 0.22f
+            typeface = context.font(10.5f, true)
+            gravity = Gravity.CENTER
+            setTextColor(Palette.gold)
+            background = context.roundedBackground(
+                Palette.panel,
+                withAlpha(Palette.gold, 0.35f),
+                15f,
+                1f
+            )
+            setPadding(context.dp(14f), context.dp(15f), context.dp(14f), context.dp(15f))
+            isClickable = true
+            contentDescription = "Open voice diagnostics"
+            setOnClickListener { showDiagnostics() }
+        }
+        content.addView(diagnostics, matchWrap().apply { topMargin = context.dp(8f) })
+        content.addView(
+            helperText("Voice not heard or not responding? Reproduce once, open DIAGNOSTICS, then SHARE the log."),
+            matchWrap().apply { topMargin = context.dp(8f) }
+        )
 
         voiceValue = addSelector(content, "VOICE", selectedVoice) { valueView ->
             showVoiceChooser(valueView)
@@ -513,6 +562,147 @@ class SettingsDialog(
             window.navigationBarColor = Palette.bg
         }
     }
+
+    private fun showDiagnostics() {
+        val dialog = Dialog(context)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val root = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(context.dp(18f), context.dp(18f), context.dp(18f), context.dp(14f))
+            background = context.roundedBackground(Palette.bg, withAlpha(Palette.cyan, 0.45f), 22f, 1.2f)
+        }
+        root.addView(context.label("DIAGNOSTICS", 19f, Palette.ice, 0.22f, true))
+        root.addView(
+            context.label("Mic, transcript and command trace", 9.5f, Palette.cyanDim, 0.18f),
+            matchWrap().apply { topMargin = context.dp(3f) }
+        )
+        root.addView(
+            context.label(
+                "May contain transcript text. Review before sharing.",
+                9f,
+                Palette.gold,
+                0.02f
+            ),
+            matchWrap().apply { topMargin = context.dp(8f) }
+        )
+        val scroll = ScrollView(context).apply {
+            isFillViewport = false
+            clipToPadding = false
+        }
+        val body = TextView(context).apply {
+            text = Diagnostics.dump(context)
+            typeface = Typeface.MONOSPACE
+            textSize = 9f
+            setTextColor(Palette.ice)
+            setPadding(0, context.dp(10f), 0, context.dp(10f))
+            setTextIsSelectable(true)
+        }
+        scroll.addView(
+            body,
+            ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        fun refresh() {
+            body.text = Diagnostics.dump(context)
+        }
+
+        val firstRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        firstRow.addView(
+            diagnosticButton("COPY") {
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                if (clipboard == null) {
+                    Toast.makeText(context, "Clipboard unavailable", Toast.LENGTH_SHORT).show()
+                } else {
+                    clipboard.setPrimaryClip(
+                        ClipData.newPlainText("Jarvis diagnostics", body.text.toString())
+                    )
+                    Toast.makeText(context, "Diagnostics copied", Toast.LENGTH_SHORT).show()
+                }
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        firstRow.addView(
+            diagnosticButton("SHARE") {
+                try {
+                    val send = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_SUBJECT, "Jarvis diagnostics")
+                        putExtra(Intent.EXTRA_TEXT, body.text.toString())
+                    }
+                    context.startActivity(
+                        Intent.createChooser(send, "Share Jarvis diagnostics")
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                } catch (_: Throwable) {
+                    Toast.makeText(context, "No app available to share", Toast.LENGTH_SHORT).show()
+                }
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = context.dp(8f)
+            }
+        )
+        root.addView(firstRow, matchWrap().apply { topMargin = context.dp(10f) })
+
+        val secondRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        secondRow.addView(
+            diagnosticButton("REFRESH") { refresh() },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        secondRow.addView(
+            diagnosticButton("CLEAR") {
+                Diagnostics.clear()
+                refresh()
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = context.dp(8f)
+            }
+        )
+        secondRow.addView(
+            diagnosticButton("CLOSE") { dialog.dismiss() },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = context.dp(8f)
+            }
+        )
+        root.addView(secondRow, matchWrap().apply { topMargin = context.dp(8f) })
+
+        dialog.setContentView(root)
+        dialog.setOnShowListener {
+            root.applySystemBarPadding()
+        }
+        dialog.show()
+        dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+    }
+
+    private fun diagnosticButton(label: String, onClick: () -> Unit): TextView =
+        TextView(context).apply {
+            text = label
+            textSize = 10f
+            letterSpacing = 0.16f
+            typeface = context.font(10f, true)
+            gravity = Gravity.CENTER
+            setTextColor(Palette.cyan)
+            background = context.roundedBackground(
+                Palette.panel,
+                withAlpha(Palette.cyan, 0.4f),
+                13f,
+                1f
+            )
+            setPadding(0, context.dp(11f), 0, context.dp(11f))
+            isClickable = true
+            contentDescription = label
+            setOnClickListener { onClick() }
+        }
 
     private fun showHelp() {
         val dialog = Dialog(context)

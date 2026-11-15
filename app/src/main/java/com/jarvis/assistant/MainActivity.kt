@@ -26,6 +26,7 @@ import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONObject
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
@@ -66,6 +67,16 @@ class MainActivity : Activity() {
     private var lastReminderIntentAt = 0L
     private var lastReminderNoteId = 0L
     private var lastReminderRawText = ""
+    private var pendingBulkDelete = false
+    private var pendingBulkDeleteAt = 0L
+    private var pendingBulkDeleteNotes = false
+    private var pendingBulkDeleteKey = ""
+    private var lastClockCommandKey = ""
+    private var lastClockCommandAt = 0L
+    private var lastDeleteCommandKey = ""
+    private var lastDeleteCommandAt = 0L
+    private var lastDeviceCommandKey = ""
+    private var lastDeviceCommandAt = 0L
     private var reminderFlowToken = 0
     private var reminderAckAwaiting = false
     private var reminderAckDone = false
@@ -83,6 +94,21 @@ class MainActivity : Activity() {
     private var reminderFailureSent = false
     private val reminderFinalPauseMs = 1600L
     private val reminderHandler = Handler(Looper.getMainLooper())
+    private val voiceLocalHandler = Handler(Looper.getMainLooper())
+    private var pendingVoiceLocalText = ""
+    private var voiceTurnFinished = true
+    private var voiceFallbackHandled = false
+    private val runPendingVoiceLocal = Runnable {
+        if (voiceTurnFinished) return@Runnable
+        val text = pendingVoiceLocalText
+        pendingVoiceLocalText = ""
+        if (text.isNotBlank()) {
+            val handled = handleLocalCommandOnly(text)
+            Log.d("JarvisDebug", "voice local fallback '$text' handled=$handled")
+            Diagnostics.log("FALLBACK", "run '${text.take(180)}' handled=$handled")
+            voiceFallbackHandled = handled
+        }
+    }
     private var pendingReminderText = ""
     private val parsePendingReminder = Runnable {
         val text = pendingReminderText
@@ -110,6 +136,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Diagnostics.log("APP", "onCreate")
         JarvisPrefs.init(applicationContext)
         ChatStore.init(applicationContext)
         MemoryStore.init(applicationContext)
@@ -149,10 +176,12 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        Diagnostics.log("APP", "onResume active=$active connecting=$connecting muted=$micMuted")
     }
 
     override fun onPause() {
         super.onPause()
+        Diagnostics.log("APP", "onPause active=$active connecting=$connecting muted=$micMuted")
     }
 
     override fun onStop() {
@@ -170,6 +199,9 @@ class MainActivity : Activity() {
         ReminderBus.removeListener(reminderListener)
         reminderHandler.removeCallbacks(parsePendingReminder)
         pendingReminderText = ""
+        cancelVoiceLocalFallback()
+        voiceTurnFinished = true
+        voiceFallbackHandled = false
         resetReminderConfirmation()
         if (client != null || audio != null) {
             stopRequested = true
@@ -386,6 +418,12 @@ class MainActivity : Activity() {
 
     private fun startSession() {
         if (active || connecting) return
+        Diagnostics.log(
+            "APP",
+            "startSession model=${JarvisPrefs.model} " +
+                "key=${if (JarvisPrefs.hasApiKey()) "present" else "missing"} " +
+                "resume=${JarvisPrefs.sessionHandle.isNotBlank()}"
+        )
         stopUnmuteDetector()
         ChatStore.beginSession()
         ChatStore.sessionActive = true
@@ -414,14 +452,19 @@ class MainActivity : Activity() {
             onMicChunk = { chunk ->
                 client?.sendAudio(if (micMuted) ByteArray(chunk.size) else chunk)
             },
-            onMicLevel = { level -> if (!micMuted) orb.post { orb.setLevel(level) } },
+            onMicLevel = { level ->
+                if (!micMuted) {
+                    Diagnostics.micLevel(level)
+                    orb.post { orb.setLevel(level) }
+                }
+            },
             onPlaybackLevel = { level -> orb.post { orb.setLevel(level) } }
         )
 
         val memoryBlock = MemoryStore.promptBlock()
         val baseInstruction = JarvisPrefs.effectiveInstruction() + "\n\n" +
             APP_CONTROL_INSTRUCTION + "\n\n" + DEVICE_CONTROL_INSTRUCTION + "\n\n" +
-            SILENT_COMMAND_INSTRUCTION
+            SYSTEM_CLOCK_INSTRUCTION + "\n\n" + SILENT_COMMAND_INSTRUCTION
         val systemInstruction = if (memoryBlock.isBlank()) {
             baseInstruction
         } else {
@@ -467,6 +510,9 @@ class MainActivity : Activity() {
         stopUnmuteDetector()
         reminderHandler.removeCallbacks(parsePendingReminder)
         pendingReminderText = ""
+        cancelVoiceLocalFallback()
+        voiceTurnFinished = true
+        voiceFallbackHandled = false
         resetReminderConfirmation()
         connectionWatchdog?.let { orb.removeCallbacks(it) }
         connectionWatchdog = null
@@ -843,26 +889,632 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun handleAppCommand(raw: String, allowNoteCreate: Boolean = true): Boolean {
+    private fun handleAppCommand(
+        raw: String,
+        allowNoteCreate: Boolean = true,
+        skipLocal: Boolean = false
+    ): Boolean {
         val command = SpeechCorrectionResolver.latestInstruction(raw)
+        Diagnostics.log(
+            "CMD",
+            "handle allowNote=$allowNoteCreate skipLocal=$skipLocal " +
+                "raw='${raw.take(180)}' latest='${command.take(180)}'"
+        )
+        if (allowNoteCreate && handlePendingBulkDelete(command)) {
+            Diagnostics.log("CMD", "handled by=pendingBulkDelete")
+            return true
+        }
         if (allowNoteCreate && !command.equals(raw.trim(), ignoreCase = true)) {
             val latestAction = parseSilentAction(command)
             if (latestAction != null) {
+                Diagnostics.log("CMD", "handled by=latestAction ${latestAction.name}")
                 runSilentAction(latestAction, force = true)
                 return true
             }
         }
-        if (allowNoteCreate && handleReminderQuery(raw)) return true
-        if (allowNoteCreate && handleVoiceReminder(raw)) return true
-        if (allowNoteCreate && handleNoteCreation(command)) return true
+        if (allowNoteCreate && !skipLocal && handleSystemClockCommand(command)) {
+            Diagnostics.log("CMD", "handled by=systemClock")
+            return true
+        }
+        if (allowNoteCreate && !skipLocal && handleDeleteCommand(command)) {
+            Diagnostics.log("CMD", "handled by=delete")
+            return true
+        }
+        if (allowNoteCreate && !skipLocal && handleDeviceControlCommand(command)) {
+            Diagnostics.log("CMD", "handled by=deviceControl")
+            return true
+        }
+        if (allowNoteCreate && handleReminderQuery(raw)) {
+            Diagnostics.log("CMD", "handled by=reminderQuery")
+            return true
+        }
+        if (allowNoteCreate && handleVoiceReminder(raw)) {
+            Diagnostics.log("CMD", "handled by=voiceReminder")
+            return true
+        }
+        if (allowNoteCreate && handleNoteCreation(command)) {
+            Diagnostics.log("CMD", "handled by=noteCreation")
+            return true
+        }
         if (VoiceReminderParser.hasTrigger(command) && !isExplicitNotesOpen(command)) {
+            Diagnostics.log("CMD", "handled by=reminderAsk")
             if (allowNoteCreate) askForReminderTime()
             return true
         }
         val action = parseSilentAction(command)
         Log.d("JarvisDebug", "parse '$command' -> ${action?.name ?: "none"}")
-        if (action == null) return false
+        Diagnostics.log("CMD", "silentAction=${action?.name ?: "none"}")
+        if (action == null) {
+            Diagnostics.log("CMD", "handled=false")
+            return false
+        }
         runSilentAction(action)
+        Diagnostics.log("CMD", "handled by=silentAction ${action.name}")
+        return true
+    }
+
+    private fun scheduleVoiceLocalFallback(text: String) {
+        if (text.isBlank()) return
+        if (pendingVoiceLocalText != text) {
+            Diagnostics.log("FALLBACK", "arm '${text.take(180)}'")
+        }
+        pendingVoiceLocalText = text
+        voiceLocalHandler.removeCallbacks(runPendingVoiceLocal)
+        voiceLocalHandler.postDelayed(runPendingVoiceLocal, 2500L)
+    }
+
+    private fun cancelVoiceLocalFallback() {
+        voiceLocalHandler.removeCallbacks(runPendingVoiceLocal)
+        pendingVoiceLocalText = ""
+    }
+
+    private fun handleLocalCommandOnly(raw: String): Boolean {
+        val command = SpeechCorrectionResolver.latestInstruction(raw)
+        if (handleSystemClockCommand(command, allowAsk = false)) {
+            Diagnostics.log("LOCAL", "clock handled")
+            return true
+        }
+        if (handleDeleteCommand(command)) {
+            Diagnostics.log("LOCAL", "delete handled")
+            return true
+        }
+        if (handleDeviceControlCommand(command, allowToggle = false)) {
+            Diagnostics.log("LOCAL", "device handled")
+            return true
+        }
+        Diagnostics.log("LOCAL", "not handled")
+        return false
+    }
+
+    private fun wordSet(raw: String): Set<String> = raw.lowercase()
+        .split(Regex("[^\\p{L}\\p{M}\\p{N}]+"))
+        .filter { it.isNotEmpty() }
+        .toSet()
+
+    private fun localCommandKey(raw: String): String = raw.lowercase()
+        .replace(Regex("[^\\p{L}\\p{M}\\p{N}]+"), " ")
+        .trim()
+
+    private fun handleSystemClockCommand(raw: String, allowAsk: Boolean = true): Boolean {
+        val key = localCommandKey(raw)
+        val now = SystemClock.elapsedRealtime()
+        if (key.isNotBlank() && key == lastClockCommandKey &&
+            now - lastClockCommandAt < 3000L
+        ) return true
+        val handled = performSystemClockCommand(raw, allowAsk)
+        if (handled) {
+            lastClockCommandKey = key
+            lastClockCommandAt = now
+        }
+        Diagnostics.log("CLOCK", "raw='${raw.take(140)}' handled=$handled")
+        return handled
+    }
+
+    private fun performSystemClockCommand(raw: String, allowAsk: Boolean): Boolean {
+        val lower = raw.lowercase()
+        val words = wordSet(raw)
+        val hasReminder = words.contains("reminder") || words.contains("reminders") ||
+            words.contains("alert") || words.contains("yaad") ||
+            lower.contains("रिमाइंडर") || lower.contains("एलर्ट")
+        if (hasReminder) return false
+        val hasAlarm = words.contains("alarm") || words.contains("alarms") ||
+            lower.contains("अलार्म")
+        val hasTimer = words.contains("timer") || words.contains("timers") ||
+            lower.contains("टाइमर")
+        if (!hasAlarm && !hasTimer) return false
+        if (hasAlarm && handleAlarmCommand(raw, words, allowAsk)) return true
+        if (hasTimer && handleTimerCommand(raw, words, allowAsk)) return true
+        return false
+    }
+
+    private fun handleAlarmCommand(
+        raw: String,
+        words: Set<String>,
+        allowAsk: Boolean = true
+    ): Boolean {
+        val deleteWords = setOf(
+            "delete", "remove", "cancel", "dismiss", "band", "off", "hatao",
+            "hata", "mita", "mitao", "clear", "dlt", "डिलीट", "हटाओ", "हटा",
+            "मिटाओ", "मिटा", "कैंसिल", "बंद", "बन्द", "ऑफ"
+        )
+        val showWords = setOf(
+            "show", "open", "kholo", "khol", "dikhao", "dikha", "list", "batao",
+            "दिखाओ", "खोलो", "खोल", "सूची", "बताओ"
+        )
+        val setWords = setOf(
+            "set", "lagao", "laga", "lagana", "lagado", "banao", "bana", "add",
+            "create", "rakho", "karo", "kar", "kardo", "start", "chalu",
+            "लगाओ", "लगा", "सेट", "बनाओ", "बना", "जोड़ो", "शुरू", "करो", "कर"
+        )
+        val wantsDelete = words.any { it in deleteWords }
+        val wantsShow = words.any { it in showWords }
+        val wantsSet = words.any { it in setWords }
+        if (wantsDelete) {
+            val at = parseAlarmAt(raw)
+            beginSilentTurn()
+            toast(SystemClockController.dismissAlarm(this, at))
+            return true
+        }
+        if (wantsShow && !wantsSet) {
+            beginSilentTurn()
+            toast(SystemClockController.showAlarms(this))
+            return true
+        }
+        val at = parseAlarmAt(raw)
+        if (at != null && !looksLikeQuestion(raw)) {
+            Diagnostics.log("CLOCK", "setAlarm at=$at")
+            beginSilentTurn()
+            toast(SystemClockController.setAlarm(this, at, "Jarvis"))
+            return true
+        }
+        if (allowAsk && !looksLikeQuestion(raw) && (wantsSet || words.size <= 2)) {
+            askForAlarmTime()
+            return true
+        }
+        return false
+    }
+
+    private fun parseAlarmAt(raw: String): Long? {
+        val at = VoiceReminderParser.parseTimeOnly(raw) ?: return null
+        val lower = raw.lowercase()
+        val hasExplicit = Regex(
+            "\\b(am|pm|subah|morning|dopahar|afternoon|shaam|sham|evening|raat|rat|night|" +
+                "kal|tomorrow|parso|aaj|today|" +
+                "jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|" +
+                "january|february|march|april|june|july|august|september|october|november|" +
+                "december|minute|minutes|min|mins|hour|hours|ghanta|ghante|second|seconds|" +
+                "sec|secs|baad|bad|after)\\b"
+        ).containsMatchIn(lower) ||
+            Regex("सुबह|दोपहर|शाम|रात|कल|आज|परसों").containsMatchIn(lower) ||
+            Regex("\\d{1,2}[/-]\\d{1,2}").containsMatchIn(lower) ||
+            Regex("\\b(1[3-9]|2[0-3])(:\\d{2}|\\s*baje)\\b").containsMatchIn(lower)
+        if (hasExplicit) return at
+        val parsed = Calendar.getInstance().apply { timeInMillis = at }
+        val hour12 = parsed.get(Calendar.HOUR_OF_DAY) % 12
+        val minute = parsed.get(Calendar.MINUTE)
+        val now = System.currentTimeMillis()
+        val base = Calendar.getInstance().apply {
+            timeInMillis = now
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        var best: Long? = null
+        for (day in 0..2) {
+            val dayBase = (base.clone() as Calendar).apply { add(Calendar.DAY_OF_YEAR, day) }
+            for (hour in intArrayOf(hour12, hour12 + 12)) {
+                val candidate = (dayBase.clone() as Calendar).apply {
+                    set(Calendar.HOUR_OF_DAY, hour)
+                    set(Calendar.MINUTE, minute)
+                }.timeInMillis
+                if (candidate > now && (best == null || candidate < best)) best = candidate
+            }
+        }
+        return best ?: at
+    }
+
+    private fun handleTimerCommand(
+        raw: String,
+        words: Set<String>,
+        allowAsk: Boolean = true
+    ): Boolean {
+        val deleteWords = setOf(
+            "delete", "remove", "cancel", "dismiss", "band", "off", "hatao",
+            "hata", "mita", "mitao", "clear", "dlt", "डिलीट", "हटाओ", "हटा",
+            "मिटाओ", "मिटा", "कैंसिल", "बंद", "बन्द", "ऑफ"
+        )
+        val showWords = setOf(
+            "show", "open", "kholo", "khol", "dikhao", "dikha", "list", "batao",
+            "दिखाओ", "खोलो", "खोल", "सूची", "बताओ"
+        )
+        val setWords = setOf(
+            "set", "lagao", "laga", "lagana", "lagado", "banao", "bana", "add",
+            "create", "rakho", "karo", "kar", "kardo", "start", "chalu",
+            "लगाओ", "लगा", "सेट", "बनाओ", "बना", "जोड़ो", "शुरू", "करो", "कर"
+        )
+        val wantsDelete = words.any { it in deleteWords }
+        val wantsShow = words.any { it in showWords }
+        val wantsSet = words.any { it in setWords }
+        if (wantsDelete || (wantsShow && !wantsSet)) {
+            beginSilentTurn()
+            toast(SystemClockController.showTimers(this))
+            return true
+        }
+        val seconds = SystemClockController.parseDurationSeconds(raw)
+        if (seconds != null) {
+            Diagnostics.log("CLOCK", "setTimer seconds=$seconds")
+            beginSilentTurn()
+            toast(SystemClockController.setTimer(this, seconds, "Jarvis"))
+            return true
+        }
+        if (allowAsk && !looksLikeQuestion(raw) && (wantsSet || words.size <= 2)) {
+            askForTimerDuration()
+            return true
+        }
+        return false
+    }
+
+    private fun askForAlarmTime() {
+        val live = client
+        if (live != null && active) {
+            live.sendText(
+                "[SYSTEM] The user wants to set a phone alarm but did not give a time. " +
+                    "Ask exactly one short question in the user's language: " +
+                    "\"Alarm kis time ka lagana hai?\" " +
+                    "Do not mention reminders, notepad or any page."
+            )
+        } else {
+            toast("Alarm kis time ka lagana hai?")
+        }
+    }
+
+    private fun askForTimerDuration() {
+        val live = client
+        if (live != null && active) {
+            live.sendText(
+                "[SYSTEM] The user wants to set a phone timer but did not give a duration. " +
+                    "Ask exactly one short question in the user's language: " +
+                    "\"Timer kitne minute ka lagana hai?\" " +
+                    "Do not mention reminders, notepad or any page."
+            )
+        } else {
+            toast("Timer kitne minute ka lagana hai?")
+        }
+    }
+
+    private fun handleDeleteCommand(raw: String): Boolean {
+        val key = localCommandKey(raw)
+        val now = SystemClock.elapsedRealtime()
+        if (key.isNotBlank() && key == lastDeleteCommandKey &&
+            now - lastDeleteCommandAt < 3000L
+        ) return true
+        val handled = performDeleteCommand(raw)
+        if (handled) {
+            lastDeleteCommandKey = key
+            lastDeleteCommandAt = now
+        }
+        Diagnostics.log("DELETE", "raw='${raw.take(140)}' handled=$handled")
+        return handled
+    }
+
+    private fun performDeleteCommand(raw: String): Boolean {
+        val lower = raw.lowercase()
+        val words = wordSet(raw)
+        val deleteWords = setOf(
+            "delete", "remove", "clear", "dlt", "mita", "mitao", "mitado",
+            "hatao", "hata", "cancel", "band", "डिलीट", "हटाओ", "हटा",
+            "मिटाओ", "मिटा", "कैंसिल", "बंद", "बन्द"
+        )
+        if (words.none { it in deleteWords }) return false
+        val hasReminder = words.contains("reminder") || words.contains("reminders") ||
+            words.contains("alert") || words.contains("yaad") ||
+            lower.contains("रिमाइंडर") || lower.contains("एलर्ट")
+        val hasNote = words.contains("note") || words.contains("notes") ||
+            words.contains("notepad") || lower.contains("नोट")
+        if (!hasReminder && !hasNote) return false
+        val wantsAll = words.any {
+            it in setOf("all", "sab", "saare", "sari", "saari", "everything")
+        }
+        if (wantsAll) {
+            pendingBulkDelete = true
+            pendingBulkDeleteAt = SystemClock.elapsedRealtime()
+            pendingBulkDeleteNotes = hasNote && !hasReminder
+            pendingBulkDeleteKey = localCommandKey(raw)
+            askBulkDeleteConfirmation(pendingBulkDeleteNotes)
+            return true
+        }
+        if (hasReminder) {
+            val note = findReminderForDelete(raw)
+            if (note == null) {
+                beginSilentTurn()
+                toast("Koi matching reminder nahi mila.")
+                return true
+            }
+            deleteNote(note)
+            beginSilentTurn()
+            toast("Reminder deleted.")
+            return true
+        }
+        val note = findNoteForDelete(raw)
+        if (note == null) {
+            beginSilentTurn()
+            toast("Koi matching note nahi mila.")
+            return true
+        }
+        deleteNote(note)
+        beginSilentTurn()
+        toast("Note deleted.")
+        return true
+    }
+
+    private fun askBulkDeleteConfirmation(notes: Boolean) {
+        val what = if (notes) "notes" else "reminders"
+        val live = client
+        if (live != null && active) {
+            live.sendText(
+                "[SYSTEM] The user asked to delete all $what. Ask exactly one short " +
+                    "confirmation question in the user's language: " +
+                    "\"Confirm karo: sab $what delete karu? Haan ya nahi.\" " +
+                    "Do not delete anything yet."
+            )
+        } else {
+            toast("Confirm karo: sab $what delete karu? Haan ya nahi.")
+        }
+    }
+
+    private fun handlePendingBulkDelete(raw: String): Boolean {
+        if (!pendingBulkDelete) return false
+        if (SystemClock.elapsedRealtime() - pendingBulkDeleteAt > 20_000L) {
+            pendingBulkDelete = false
+            return false
+        }
+        val key = localCommandKey(raw)
+        if (pendingBulkDeleteKey.isNotBlank() &&
+            (key == pendingBulkDeleteKey ||
+                key.contains(pendingBulkDeleteKey) ||
+                pendingBulkDeleteKey.contains(key))
+        ) return true
+        val words = wordSet(raw)
+        val yes = words.any {
+            it in setOf(
+                "haan", "han", "ha", "yes", "yep", "confirm", "ok", "okay",
+                "हाँ", "हां", "हा", "ठीक", "कन्फर्म"
+            )
+        }
+        val no = words.any {
+            it in setOf("nahi", "nahin", "no", "cancel", "mat", "stop", "नहीं", "ना", "मत", "रद्द")
+        }
+        if (yes) {
+            val notes = pendingBulkDeleteNotes
+            val target = if (notes) {
+                NoteStore.all().filter { it.remindAt <= 0L }
+            } else {
+                NoteStore.all().filter { it.remindAt > 0L }
+            }
+            var removed = 0
+            for (note in target) {
+                if (deleteNote(note)) removed++
+            }
+            pendingBulkDelete = false
+            beginSilentTurn()
+            toast(if (notes) "$removed notes deleted." else "$removed reminders deleted.")
+            return true
+        }
+        if (no) {
+            pendingBulkDelete = false
+            beginSilentTurn()
+            toast("Delete cancelled.")
+            return true
+        }
+        pendingBulkDelete = false
+        return false
+    }
+
+    private fun findReminderForDelete(raw: String): NoteStore.Note? {
+        val notes = NoteStore.all().filter { it.remindAt > 0L }
+        val words = wordSet(raw)
+        val wantsLast = words.any {
+            it in setOf("last", "latest", "recent", "aakhri", "akhri", "pichla")
+        }
+        if (wantsLast) return notes.firstOrNull()
+        val query = deleteSearchQuery(raw)
+        if (query.isBlank()) return notes.firstOrNull()
+        return notes.firstOrNull { note ->
+            note.title.contains(query, ignoreCase = true) ||
+                note.body.contains(query, ignoreCase = true)
+        }
+    }
+
+    private fun findNoteForDelete(raw: String): NoteStore.Note? {
+        val notes = NoteStore.all()
+        val plain = notes.filter { it.remindAt <= 0L }
+        val words = wordSet(raw)
+        val wantsLast = words.any {
+            it in setOf("last", "latest", "recent", "aakhri", "akhri", "pichla")
+        }
+        if (wantsLast) return plain.firstOrNull() ?: notes.firstOrNull()
+        val query = deleteSearchQuery(raw)
+        if (query.isBlank()) return plain.firstOrNull() ?: notes.firstOrNull()
+        return plain.firstOrNull { note ->
+            note.title.contains(query, ignoreCase = true) ||
+                note.body.contains(query, ignoreCase = true)
+        } ?: notes.firstOrNull { note ->
+            note.title.contains(query, ignoreCase = true) ||
+                note.body.contains(query, ignoreCase = true)
+        }
+    }
+
+    private fun deleteSearchQuery(raw: String): String {
+        val ignore = setOf(
+            "delete", "remove", "clear", "dlt", "mita", "mitao", "mitado",
+            "hatao", "hata", "cancel", "band", "reminder", "reminders",
+            "note", "notes", "notepad", "last", "latest", "recent", "aakhri",
+            "akhri", "pichla", "karo", "kar", "kardo", "do", "de", "dijiye",
+            "mera", "meri", "mere", "wala", "wali", "wale", "ka", "ke", "ki",
+            "ko", "se", "me", "mein", "please", "pls", "plz", "नोट", "नोट्स",
+            "रिमाइंडर", "करो", "कर", "दो", "मेरा", "मेरी", "का", "के", "की",
+            "डिलीट", "हटाओ", "हटा", "मिटाओ", "मिटा", "कैंसिल", "बंद", "बन्द"
+        )
+        return raw.lowercase()
+            .replace(Regex("[^\\p{L}\\p{M}\\p{N}\\s]"), " ")
+            .split(Regex("\\s+"))
+            .filter { it.isNotBlank() && it !in ignore }
+            .joinToString(" ")
+            .trim()
+    }
+
+    private fun deleteNote(note: NoteStore.Note): Boolean {
+        if (note.remindAt > 0L) {
+            try {
+                ReminderScheduler.cancel(applicationContext, note.id)
+            } catch (_: Throwable) {
+            }
+        }
+        return NoteStore.delete(note.id)
+    }
+
+    private fun handleDeviceControlCommand(
+        raw: String,
+        allowToggle: Boolean = true
+    ): Boolean {
+        val key = localCommandKey(raw)
+        val now = SystemClock.elapsedRealtime()
+        if (key.isNotBlank() && key == lastDeviceCommandKey &&
+            now - lastDeviceCommandAt < 800L
+        ) return true
+        val handled = performDeviceControlCommand(raw, allowToggle)
+        if (handled) {
+            lastDeviceCommandKey = key
+            lastDeviceCommandAt = now
+        }
+        Diagnostics.log("DEVICE", "raw='${raw.take(140)}' handled=$handled")
+        return handled
+    }
+
+    private fun performDeviceControlCommand(raw: String, allowToggle: Boolean): Boolean {
+        return handleFlashlightCommand(raw, allowToggle) ||
+            handleMediaCommand(raw) ||
+            handleVolumeCommand(raw)
+    }
+
+    private fun handleFlashlightCommand(
+        raw: String,
+        allowToggle: Boolean = true
+    ): Boolean {
+        val lower = raw.lowercase()
+        val words = wordSet(raw)
+        val isFlashlight = words.contains("flashlight") || words.contains("torch") ||
+            words.contains("flash") || lower.contains("फ्लैशलाइट") ||
+            lower.contains("टॉर्च")
+        if (!isFlashlight) return false
+        val off = words.any {
+            it in setOf(
+                "off", "band", "bujhao", "bujha", "bujhado", "stop",
+                "बंद", "बन्द", "ऑफ", "बुझाओ", "बुझा"
+            )
+        }
+        val on = words.any {
+            it in setOf(
+                "on", "chalu", "start", "jalao", "jala", "jalado", "enable",
+                "चालू", "जलाओ", "जला", "ऑन"
+            )
+        }
+        if (!off && !on && !allowToggle) return false
+        val target = when {
+            off -> false
+            on -> true
+            else -> null
+        }
+        Diagnostics.log("DEVICE", "flashlight target=${target?.toString() ?: "toggle"}")
+        beginSilentTurn()
+        toast(DeviceController.setFlashlight(this, target))
+        return true
+    }
+
+    private fun handleMediaCommand(raw: String): Boolean {
+        val lower = raw.lowercase()
+        val words = wordSet(raw)
+        val hasMedia = words.any {
+            it in setOf("song", "songs", "gana", "gane", "gaana", "music", "track", "audio")
+        } || lower.contains("संगीत") || lower.contains("गाना")
+        val next = words.any {
+            it in setOf("next", "agla", "agle", "skip", "aage", "अगला", "अगले")
+        }
+        val previous = words.any {
+            it in setOf(
+                "previous", "prev", "pichla", "pichhla", "back", "peeche",
+                "पिछला", "पिछले"
+            )
+        }
+        val pause = words.any {
+            it in setOf("pause", "paused", "roko", "rok", "band", "रोको", "रोक", "बंद")
+        }
+        val play = words.any {
+            it in setOf("play", "resume", "chalao", "chala", "bajao", "baja", "चलाओ", "चला", "बजाओ", "बजा")
+        }
+        val stop = words.any { it in setOf("stop") }
+        if ((next || previous) && !hasMedia) return false
+        val action = when {
+            next -> "next"
+            previous -> "previous"
+            stop -> "stop"
+            pause -> "pause"
+            play -> "play"
+            else -> return false
+        }
+        if (!hasMedia && action != "pause" && action != "play") return false
+        Diagnostics.log("DEVICE", "media action=$action hasMedia=$hasMedia")
+        beginSilentTurn()
+        toast(DeviceController.mediaControl(this, action))
+        return true
+    }
+
+    private fun handleVolumeCommand(raw: String): Boolean {
+        val lower = raw.lowercase()
+        val words = wordSet(raw)
+        val isVolume = words.contains("volume") || words.contains("awaaz") ||
+            words.contains("sound") || lower.contains("वॉल्यूम") ||
+            lower.contains("आवाज") || lower.contains("आवाज़")
+        if (!isVolume) return false
+        var percent = Regex("(\\d{1,3})\\s*%?").find(raw)
+            ?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?.takeIf { it in 0..100 }
+        if (words.any { it in setOf("full", "max", "maximum") }) {
+            percent = 100
+        }
+        if (percent != null) {
+            Diagnostics.log("DEVICE", "volume set percent=$percent")
+            beginSilentTurn()
+            toast(DeviceController.adjustVolume(this, "set", percent))
+            return true
+        }
+        val up = words.any {
+            it in setOf(
+                "up", "badhao", "badha", "increase", "tez", "high",
+                "बढ़ाओ", "बढ़ा", "तेज़", "तेज"
+            )
+        }
+        val down = words.any {
+            it in setOf(
+                "down", "kam", "ghatao", "ghata", "decrease", "low", "dheema",
+                "dheemi", "कम", "घटाओ", "घटा", "धीमा", "धीमी"
+            )
+        }
+        val mute = words.any {
+            it in setOf("mute", "silent", "band", "off", "म्यूट", "साइलेंट", "बंद", "बन्द", "ऑफ")
+        }
+        val unmute = words.any { it in setOf("unmute", "unmuted", "अनम्यूट") }
+        val direction = when {
+            unmute -> "unmute"
+            mute -> "mute"
+            up -> "up"
+            down -> "down"
+            else -> return false
+        }
+        Diagnostics.log("DEVICE", "volume direction=$direction")
+        beginSilentTurn()
+        toast(DeviceController.adjustVolume(this, direction))
         return true
     }
 
@@ -1360,20 +2012,25 @@ class MainActivity : Activity() {
     }
 
     private fun toast(message: String) {
+        Diagnostics.log("TOAST", message)
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     private val liveListener = object : GeminiLiveClient.Listener {
         override fun onOpen() {
             if (stopRequested) return
+            Diagnostics.log("LIVE", "onOpen")
             statusDetail.text = "Handshake complete — configuring session"
         }
 
         override fun onSetupComplete() {
             if (stopRequested) return
+            Diagnostics.log("LIVE", "onSetupComplete micMuted=$micMuted")
             if (!micMuted) {
                 val engine = audio
-                if (engine == null || !engine.startCapture()) {
+                val started = engine != null && engine.startCapture()
+                Diagnostics.log("LIVE", "mic startCapture success=$started")
+                if (!started) {
                     endWithError("MICROPHONE ERROR", "Could not open the microphone")
                     return
                 }
@@ -1420,8 +2077,15 @@ class MainActivity : Activity() {
 
         override fun onInputTranscript(text: String, finished: Boolean) {
             Log.d("JarvisDebug", "input final=$finished text=$text")
+            Diagnostics.log(
+                "ASR",
+                "final=$finished fallbackHandled=$voiceFallbackHandled " +
+                    "len=${text.length} text='${text.take(220)}'"
+            )
             ChatStore.appendUserFinal(text, finished)
             if (finished) {
+                voiceTurnFinished = true
+                cancelVoiceLocalFallback()
                 reminderHandler.removeCallbacks(parsePendingReminder)
                 pendingReminderText = ""
                 rememberCompletedSpeech()
@@ -1430,10 +2094,22 @@ class MainActivity : Activity() {
                 }
                 if (last != null) {
                     if (parseSilentAction(last.text) == null) silentActionTurn = false
-                    handleAppCommand(last.text)
+                    Diagnostics.log(
+                        "ASR",
+                        "final route skipLocal=$voiceFallbackHandled text='${last.text.take(220)}'"
+                    )
+                    handleAppCommand(last.text, skipLocal = voiceFallbackHandled)
                 }
-            } else if (text.isNotBlank()) {
-                currentUserText()?.let { scheduleVoiceReminder(it) }
+            } else {
+                if (voiceTurnFinished) {
+                    voiceTurnFinished = false
+                    voiceFallbackHandled = false
+                }
+                if (text.isNotBlank()) {
+                    val latest = currentUserText() ?: text
+                    scheduleVoiceReminder(latest)
+                    scheduleVoiceLocalFallback(latest)
+                }
             }
             if (active) {
                 orb.mode = OrbView.Mode.LISTENING
@@ -1446,11 +2122,18 @@ class MainActivity : Activity() {
 
         override fun onInterimInputTranscript(text: String) {
             Log.d("JarvisDebug", "interim text=$text")
+            Diagnostics.log("ASR", "interim len=${text.length} text='${text.take(220)}'")
+            if (voiceTurnFinished) {
+                voiceTurnFinished = false
+                voiceFallbackHandled = false
+            }
             ChatStore.appendUserInterim(text)
             ChatStore.latest()
                 ?.takeIf { it.role == ChatStore.Role.USER }
                 ?.let { handleAppCommand(it.text, allowNoteCreate = false) }
-            currentUserText()?.let { scheduleVoiceReminder(it) }
+            val latest = currentUserText() ?: text
+            scheduleVoiceReminder(latest)
+            scheduleVoiceLocalFallback(latest)
             if (active) {
                 orb.mode = OrbView.Mode.LISTENING
                 statusLabel.text = "LISTENING"
@@ -1462,6 +2145,7 @@ class MainActivity : Activity() {
 
         override fun onOutputTranscript(text: String) {
             if (silentActionTurn) return
+            Diagnostics.log("ASR", "output len=${text.length} text='${text.take(180)}'")
             ChatStore.appendModel(text)
             assistantTurnText.append(text)
             if (reminderAckAwaiting && !reminderAckDone) {
@@ -1483,6 +2167,7 @@ class MainActivity : Activity() {
         }
 
         override fun onTurnComplete() {
+            Diagnostics.log("LIVE", "onTurnComplete")
             silentActionTurn = false
             if (reminderAckAwaiting && !reminderAckDone) {
                 val elapsed = SystemClock.elapsedRealtime() - reminderAckStartedAt
@@ -1511,6 +2196,7 @@ class MainActivity : Activity() {
         }
 
         override fun onInterrupted() {
+            Diagnostics.log("LIVE", "onInterrupted")
             audio?.interrupt()
             if (reminderAckAwaiting && !reminderAckDone) finishReminderAck()
             ChatStore.interrupted()
@@ -1525,6 +2211,7 @@ class MainActivity : Activity() {
         }
 
         override fun onVoiceActivity(active: Boolean) {
+            Diagnostics.log("LIVE", "onVoiceActivity active=$active")
             if (active && this@MainActivity.active) {
                 orb.mode = OrbView.Mode.LISTENING
                 orb.setLevel(0.5f)
@@ -1532,6 +2219,7 @@ class MainActivity : Activity() {
         }
 
         override fun onGoAway(secondsLeft: Long) {
+            Diagnostics.log("LIVE", "onGoAway secondsLeft=$secondsLeft")
             if (stopRequested) return
             if (secondsLeft > 0) {
                 statusDetail.text = "Session ends in ${secondsLeft}s — restart when it closes"
@@ -1544,17 +2232,20 @@ class MainActivity : Activity() {
         }
 
         override fun onDeviceAction(name: String, args: JSONObject, id: String) {
+            Diagnostics.log("LIVE", "deviceAction name=$name args=${args.toString().take(180)}")
             beginSilentTurn()
             val result = try {
                 DeviceController.handle(this@MainActivity, name, args)
             } catch (t: Throwable) {
                 "Action failed: ${t.message ?: "unknown error"}"
             }
+            Diagnostics.log("LIVE", "deviceAction result='${result.take(180)}'")
             client?.respondToDevice(id, name, result)
         }
 
         override fun onAppCommand(name: String) {
             Log.d("JarvisDebug", "tool call $name")
+            Diagnostics.log("LIVE", "appCommand name=$name")
             val action = when (name) {
                 "open_chat" -> AppCommandRouter.Action.OPEN_CHAT
                 "close_chat" -> AppCommandRouter.Action.CLOSE_CHAT
@@ -1573,12 +2264,14 @@ class MainActivity : Activity() {
         }
 
         override fun onClosed(reason: String) {
+            Diagnostics.log("LIVE", "onClosed '$reason'")
             if (stopRequested) return
             if (tryAutoRecover()) return
             endWithError("SESSION ENDED", reason)
         }
 
         override fun onError(message: String) {
+            Diagnostics.log("LIVE", "onError '$message'")
             if (stopRequested) return
             if (tryAutoRecover()) return
             endWithError("CONNECTION LOST", message)
@@ -1636,10 +2329,20 @@ class MainActivity : Activity() {
                 "search in the browser. After a device function, keep your reply to at most one " +
                 "short sentence. Never claim an action succeeded if the tool result reports failure."
 
+        private const val SYSTEM_CLOCK_INSTRUCTION =
+            "ALARMS AND TIMERS: The word 'alarm' always means the phone's Clock app alarm, " +
+                "never a Jarvis reminder. The app sets and deletes alarms and timers locally " +
+                "and silently. Do not create a reminder for an alarm. If the user says both " +
+                "reminder and alarm, treat it as a reminder. Reminders still use 'reminder', " +
+                "'remind' or 'yaad dila'. The app also handles flashlight, media play/pause/" +
+                "next/previous, and volume locally and silently. Never claim an action " +
+                "succeeded unless the app confirms it."
+
         private const val SILENT_COMMAND_INSTRUCTION =
             "SILENT COMMANDS: For app and phone control commands (open or close screens, settings, " +
                 "memory, notes, chat, microphone, orb, back, home, Bluetooth, WiFi, open app, open " +
-                "URL), perform the action and remain COMPLETELY SILENT. Do not speak, do not output " +
+                "URL, alarm, timer, flashlight, media and volume), perform the action and remain " +
+                "COMPLETELY SILENT. Do not speak, do not output " +
                 "any text, and do not confirm, announce or describe the action. Only call the " +
                 "matching function if one exists; otherwise do nothing. If the user is asking a " +
                 "question, making conversation, or the intent is not a clear control command, do " +

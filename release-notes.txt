@@ -1,22 +1,44 @@
-JARVIS AI 3.32 — Help button
+JARVIS AI 3.33.2-diag — Voice diagnostics
 
-WHAT'S NEW
-- Settings: SAVE CONFIGURATION is slightly shorter on the right.
-- A new "?" HELP button sits next to it.
-- Help explains every feature in simple English.
-- No UPDATES section in Help. Each release note explains how to use the update.
+DIAGNOSTIC BUILD
+- Settings > DIAGNOSTICS shows the live mic peak, audio source, transcript events, command routing and Clock intent results.
+- COPY, SHARE, REFRESH and CLEAR buttons are included.
+- Reproduce "voice not heard" once, then open DIAGNOSTICS and SHARE the log.
+- The log may contain transcript text. Review it before sharing.
+- No mic sensitivity or command behaviour was changed in this build.
+
+JARVIS AI 3.33.1 — Voice command fix
+
+VOICE FIX
+- Voice commands now reach alarm, timer, flashlight, media and volume even when the live transcription has no final marker.
+- A short silence fallback runs the same local command once, without duplicate timers or alarms.
+- Spoken numbers are understood: "saat baje", "das minute", "do minute", "ek ghanta".
+- Chat/typed commands keep working exactly as before.
+
+WHAT'S NEW IN 3.33
+- "Alarm" now sets the phone's Clock app alarm. It never creates a notepad reminder.
+- Reminders still work exactly as before: "reminder", "yaad dila", "alert".
+- If a sentence has both reminder and alarm, it is treated as a reminder.
+- "Alarm band karo" dismisses the next alarm. Add a time to target one.
+- "Alarms dikhao" opens the Clock alarms screen.
+- "10 minute ka timer" sets a phone Clock timer.
+- "Timer band karo" opens the Clock timers screen.
+- Voice delete: last reminder, reminder by title, note by title, or all with confirmation.
+- Flashlight on, off, and toggle.
+- Media play, pause, next, previous, and stop. This controls the same player shown in the notification panel.
+- Volume up, down, mute, and set a percentage.
+- All device controls run silently.
 
 HOW TO USE THIS UPDATE
 1. Install this APK over the old Jarvis (same signing key).
-2. Open Jarvis Settings.
-3. Tap the "?" button next to SAVE CONFIGURATION.
-4. Scroll the help to read any feature.
+2. Open Jarvis and start the live session.
+3. Say "alarm 7 baje lagao" and check the phone Clock app.
+4. Say "reminder 7 baje lagao" and check the Jarvis notepad.
+5. Say "10 minute ka timer", "flashlight on", "pause", "next song", "volume 50%".
+6. Say "last reminder delete karo" or "note delete karo shopping".
+7. For "sab reminders delete karo", say "haan" after the confirmation question.
 
-VOICE UNMUTE (from 3.31)
-- Say "mute karo" to mute.
-- While muted, say "Hey Jarvis" to unmute without touching the screen.
-- When the app is fully closed, Jarvis does not listen.
-
-BACKGROUND APP CONTROL
-- Allow "Display over other apps" in Settings.
-- Then "YouTube kholo" and "WhatsApp kholo" work while Jarvis stays in the background.
+NOTES
+- The phone needs a default Clock app for alarms and timers.
+- Android does not allow silent bulk delete of Clock alarms. "Alarm band karo" dismisses the next alarm; the Clock app opens for other cases.
+- Android does not expose active timer IDs, so "timer band karo" opens the timers screen.

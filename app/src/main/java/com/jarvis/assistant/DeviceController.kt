@@ -4,13 +4,21 @@ import android.bluetooth.BluetoothManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.media.AudioManager
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.provider.Settings
+import android.view.KeyEvent
 import org.json.JSONObject
+import kotlin.math.roundToInt
 
 object DeviceController {
+
+    @Volatile
+    private var torchOn = false
 
     fun handle(context: Context, name: String, args: JSONObject): String = when (name) {
         "open_app" -> openApp(context, args.optString("app"))
@@ -199,6 +207,98 @@ object DeviceController {
             "WiFi controls opened."
         } catch (_: Throwable) {
             "Could not open WiFi controls."
+        }
+    }
+
+    fun setFlashlight(context: Context, enable: Boolean? = null): String {
+        Diagnostics.log("DEVICE", "setFlashlight enable=${enable?.toString() ?: "toggle"}")
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            ?: return "Flashlight is not available.".also { Diagnostics.log("DEVICE", it) }
+        val cameraId = try {
+            manager.cameraIdList.firstOrNull { id ->
+                manager.getCameraCharacteristics(id)
+                    .get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            }
+        } catch (t: Throwable) {
+            return "Could not find the flashlight: ${t.message ?: "camera unavailable"}"
+                .also { Diagnostics.log("DEVICE", it) }
+        } ?: return "This device has no flashlight.".also { Diagnostics.log("DEVICE", it) }
+        val target = enable ?: !torchOn
+        return try {
+            manager.setTorchMode(cameraId, target)
+            torchOn = target
+            (if (target) "Flashlight on." else "Flashlight off.")
+                .also { Diagnostics.log("DEVICE", it) }
+        } catch (t: SecurityException) {
+            "Flashlight permission is not available.".also { Diagnostics.log("DEVICE", it) }
+        } catch (t: Throwable) {
+            "Could not change the flashlight: ${t.message ?: "camera busy"}"
+                .also { Diagnostics.log("DEVICE", it) }
+        }
+    }
+
+    fun mediaControl(context: Context, action: String): String {
+        Diagnostics.log("DEVICE", "mediaControl action=$action")
+        val manager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            ?: return "Media control is not available.".also { Diagnostics.log("DEVICE", it) }
+        val keyCode = when (action) {
+            "play" -> KeyEvent.KEYCODE_MEDIA_PLAY
+            "pause" -> KeyEvent.KEYCODE_MEDIA_PAUSE
+            "next" -> KeyEvent.KEYCODE_MEDIA_NEXT
+            "previous" -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
+            "stop" -> KeyEvent.KEYCODE_MEDIA_STOP
+            else -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+        }
+        return try {
+            manager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+            manager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+            "Media control sent.".also { Diagnostics.log("DEVICE", it) }
+        } catch (t: Throwable) {
+            "Could not control media: ${t.message ?: "no active player"}"
+                .also { Diagnostics.log("DEVICE", it) }
+        }
+    }
+
+    fun adjustVolume(context: Context, direction: String, percent: Int? = null): String {
+        Diagnostics.log("DEVICE", "adjustVolume direction=$direction percent=$percent")
+        val manager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            ?: return "Volume control is not available.".also { Diagnostics.log("DEVICE", it) }
+        return try {
+            if (percent != null) {
+                val max = manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                val level = (max * percent.coerceIn(0, 100) / 100f)
+                    .roundToInt()
+                    .coerceIn(0, max)
+                manager.setStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    level,
+                    AudioManager.FLAG_SHOW_UI
+                )
+                "Volume set to ${percent.coerceIn(0, 100)}%."
+                    .also { Diagnostics.log("DEVICE", it) }
+            } else {
+                val adjust = when (direction) {
+                    "up" -> AudioManager.ADJUST_RAISE
+                    "down" -> AudioManager.ADJUST_LOWER
+                    "mute" -> AudioManager.ADJUST_MUTE
+                    "unmute" -> AudioManager.ADJUST_UNMUTE
+                    else -> null
+                } ?: return "Unknown volume action.".also { Diagnostics.log("DEVICE", it) }
+                manager.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    adjust,
+                    AudioManager.FLAG_SHOW_UI
+                )
+                when (direction) {
+                    "up" -> "Volume up."
+                    "down" -> "Volume down."
+                    "mute" -> "Volume muted."
+                    else -> "Volume unmuted."
+                }.also { Diagnostics.log("DEVICE", it) }
+            }
+        } catch (t: Throwable) {
+            "Could not change the volume: ${t.message ?: "audio unavailable"}"
+                .also { Diagnostics.log("DEVICE", it) }
         }
     }
 

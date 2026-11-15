@@ -2,6 +2,7 @@ package com.jarvis.assistant
 
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
 import okhttp3.OkHttpClient
@@ -63,6 +64,8 @@ class GeminiLiveClient(
 
     private var closeReason = ""
 
+    private var lastAudioDropAt = 0L
+
     private val cancelledCalls: MutableSet<String> =
         Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
@@ -73,6 +76,11 @@ class GeminiLiveClient(
     }
 
     fun connect() {
+        Diagnostics.log(
+            "LIVE",
+            "connect model=$model voice=$voice key=${if (apiKey.isBlank()) "missing" else "present"} " +
+                "resume=${!resumeHandle.isNullOrBlank()}"
+        )
         val encodedKey = URLEncoder.encode(apiKey, "UTF-8")
         val url = "wss://generativelanguage.googleapis.com/ws/" +
             "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$encodedKey"
@@ -81,8 +89,23 @@ class GeminiLiveClient(
     }
 
     fun sendAudio(pcm: ByteArray): Boolean {
-        val ws = webSocket ?: return false
-        if (!setupComplete || closed || pcm.isEmpty()) return false
+        val ws = webSocket
+        if (ws == null) {
+            logAudioDrop("no socket")
+            return false
+        }
+        if (closed) {
+            logAudioDrop("socket closed")
+            return false
+        }
+        if (!setupComplete) {
+            logAudioDrop("setup incomplete")
+            return false
+        }
+        if (pcm.isEmpty()) {
+            logAudioDrop("empty chunk")
+            return false
+        }
         return try {
             val audio = JSONObject()
                 .put("data", Base64.encodeToString(pcm, Base64.NO_WRAP))
@@ -90,8 +113,16 @@ class GeminiLiveClient(
             ws.send(JSONObject().put("realtimeInput", JSONObject().put("audio", audio)).toString())
         } catch (t: Throwable) {
             Log.w("GeminiLive", "audio send failed", t)
+            Diagnostics.log("LIVE", "audio send threw ${t.message ?: t.javaClass.simpleName}")
             false
         }
+    }
+
+    private fun logAudioDrop(reason: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastAudioDropAt < 2000L) return
+        lastAudioDropAt = now
+        Diagnostics.log("LIVE", "audio not sent: $reason")
     }
 
     fun sendAudioStreamEnd() {
@@ -188,7 +219,13 @@ class GeminiLiveClient(
                 }
             )
 
-        return JSONObject().put("setup", setup).toString()
+        return JSONObject().put("setup", setup).toString().also {
+            Diagnostics.log(
+                "LIVE",
+                "setup model=$modelName startSensitivity=START_SENSITIVITY_LOW " +
+                    "endSensitivity=END_SENSITIVITY_HIGH silenceMs=900 prefixMs=300"
+            )
+        }
     }
 
     private fun appFunctionDeclarations(): JSONArray = JSONArray().apply {
@@ -282,6 +319,7 @@ class GeminiLiveClient(
             val id = call.optString("id", "")
             val name = call.optString("name", "")
             Log.d("JarvisLive", "toolCall name=$name id=$id")
+            Diagnostics.log("LIVE", "toolCall name=$name id=$id")
             if (isAppFunction(name)) {
                 handler.post { listener.onAppCommand(name) }
                 sendToolResponse(id, name, "ok")
@@ -360,6 +398,7 @@ class GeminiLiveClient(
     private val socketListener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             if (closed) return
+            Diagnostics.log("LIVE", "socket onOpen")
             handler.post { listener.onOpen() }
             try {
                 webSocket.send(buildSetup())
@@ -377,6 +416,7 @@ class GeminiLiveClient(
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            Diagnostics.log("LIVE", "socket onClosing code=$code reason='${reason.take(160)}'")
             closeReason = reason
             try {
                 webSocket.close(code, reason)
@@ -387,6 +427,7 @@ class GeminiLiveClient(
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             if (closed) return
             closed = true
+            Diagnostics.log("LIVE", "socket onClosed code=$code reason='${reason.take(160)}'")
             val text = when {
                 reason.isNotBlank() -> reason
                 closeReason.isNotBlank() -> closeReason
@@ -400,6 +441,7 @@ class GeminiLiveClient(
             if (closed) return
             closed = true
             val message = readFailure(response, t)
+            Diagnostics.log("LIVE", "socket onFailure '$message'")
             handler.post { listener.onError(message) }
         }
     }
@@ -411,12 +453,14 @@ class GeminiLiveClient(
             obj.optJSONObject("error")?.let { error ->
                 val code = error.optInt("code", 0)
                 val message = error.optString("message").ifBlank { "Gemini Live rejected the request" }
+                Diagnostics.log("LIVE", "server error code=$code '$message'")
                 fail(if (code != 0) "$message (code $code)" else message)
                 return
             }
 
             if (obj.has("setupComplete")) {
                 setupComplete = true
+                Diagnostics.log("LIVE", "setupComplete")
                 handler.post { listener.onSetupComplete() }
                 return
             }
@@ -456,13 +500,24 @@ class GeminiLiveClient(
                     val text = t.optString("text")
                     val finished = t.optBoolean("finished", false)
                     if (text.isNotEmpty() || finished) {
+                        Diagnostics.log(
+                            "LIVE",
+                            "inputTranscription final=$finished len=${text.length} " +
+                                "text='${text.take(180)}'"
+                        )
                         handler.post { listener.onInputTranscript(text, finished) }
                     }
                 }
 
                 content.optJSONObject("interimInputTranscription")?.let { t ->
                     val text = t.optString("text")
-                    if (text.isNotEmpty()) handler.post { listener.onInterimInputTranscript(text) }
+                    if (text.isNotEmpty()) {
+                        Diagnostics.log(
+                            "LIVE",
+                            "interimInputTranscription len=${text.length} text='${text.take(180)}'"
+                        )
+                        handler.post { listener.onInterimInputTranscript(text) }
+                    }
                 }
 
                 content.optJSONObject("outputTranscription")?.let { t ->
@@ -475,6 +530,7 @@ class GeminiLiveClient(
                 }
 
                 if (content.optBoolean("turnComplete", false)) {
+                    Diagnostics.log("LIVE", "turnComplete")
                     handler.post { listener.onTurnComplete() }
                 }
             }
@@ -482,6 +538,7 @@ class GeminiLiveClient(
             obj.optJSONObject("voiceActivity")?.let { activity ->
                 val type = activity.optString("type")
                 val active = type == "ACTIVITY_START"
+                Diagnostics.log("LIVE", "voiceActivity type=$type")
                 handler.post { listener.onVoiceActivity(active) }
             }
 
@@ -495,16 +552,19 @@ class GeminiLiveClient(
 
             obj.optJSONObject("goAway")?.let { goAway ->
                 val seconds = goAway.optJSONObject("timeLeft")?.optLong("seconds", 0L) ?: 0L
+                Diagnostics.log("LIVE", "goAway seconds=$seconds")
                 handler.post { listener.onGoAway(seconds) }
             }
         } catch (t: Throwable) {
             Log.w("GeminiLive", "Could not parse server payload", t)
+            Diagnostics.log("LIVE", "payload parse failed: ${t.message ?: t.javaClass.simpleName}")
         }
     }
 
     private fun fail(message: String) {
         if (closed) return
         closed = true
+        Diagnostics.log("LIVE", "fail '$message'")
         handler.post { listener.onError(message) }
         try {
             webSocket?.cancel()
